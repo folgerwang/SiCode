@@ -7,6 +7,7 @@ hands self-contained tasks to the local model and reviews the result. "[l] task"
 usage: sicode [--mode ask|edits|auto] [--dir PATH] [--model claude-opus-5-5] [--effort high] [-p "[c] request"]
 """
 import argparse
+import base64
 import difflib
 import getpass
 import json
@@ -17,7 +18,7 @@ import sys
 import time
 
 from . import __version__, planners
-from .tools import TOOLS, Workspace, clip
+from .tools import MEDIA_EXTS, TOOLS, Workspace, clip, read_clipboard_media
 from .worker import (DEFAULT_EXE, DEFAULT_MODEL, DIRECT_PROMPT, WORKER_PROMPT, Engine, local_models, parse_reply,
                      run_task)
 
@@ -52,7 +53,10 @@ HELP = f"""{BOLD}Requests{OFF}
   /mode [name]     permission mode: ask, edits, auto
   /model [name]    Claude model for [c]: opus, sonnet, haiku, fable or a full model id
   /local [number]  the local model: lists the installed ones, or switches to one
-  /planner [name]  who plans [c] requests: api (Claude API key), claude-code, codex or agy (account login)
+  /planner [name]  who plans [c] requests: api, claude-code, codex, agy, gemini, codebuddy, tcloud
+  /providers       show activated cloud providers & account usage; /providers enable|disable <id> | auto
+  /cloud [0-100]   cloud AI share for this project (0=local, 100=cloud only & unload local, default 10)
+  /paste           attach image or video from clipboard (or press Alt+V while typing)
   /think           show or hide the local model's reasoning
   /key             set the Claude API key
   /exit            quit"""
@@ -304,9 +308,64 @@ class App:
         self.quiet_tools = False  # a delegated task: tool calls are indented under the task
         self.by = ""             # hybrid: who is acting now, "c" (the cloud model) or "l" (the local model)
         self.instructions_name, self.instructions = self.load_instructions()
-        self.planner = a.planner if a.planner != "auto" else load_config().get("planner") or \
-            planners.default_planner(have_credentials())
-        self.planner_chat = None  # the Claude Code or Codex conversation, when [c] goes through an account login
+        cfg = load_config()
+        self.enabled_planners = dict(cfg.get("enabled_planners") or {})
+        for k in planners.PLANNERS:
+            if k not in self.enabled_planners:
+                self.enabled_planners[k] = (k == "api" and have_credentials()) or bool(planners.find(k))
+        self.planner_usage = {}
+        raw_usage = cfg.get("planner_usage") or {}
+        for k in planners.PLANNERS:
+            u = raw_usage.get(k) or {}
+            self.planner_usage[k] = {"used": int(u.get("used", 0)), "quota_left": float(u.get("quota_left", 100.0)),
+                                     "quota_manual": bool(u.get("quota_manual", False))}
+        self.mix_auto = bool(cfg.get("mix_auto", True))
+        self.planner_models = dict(cfg.get("planner_models") or {})
+        self.planner_efforts = dict(cfg.get("planner_efforts") or {})
+        ratios = {os.path.realpath(k): max(0, min(100, int(v))) for k, v in (cfg.get("project_cloud_ratio") or {}).items()}
+        self.project_cloud_ratio = ratios
+        if getattr(a, "cloud", None) is not None:
+            self.cloud_ratio = max(0, min(100, int(a.cloud)))
+        else:
+            self.cloud_ratio = ratios.get(os.path.realpath(self.ws.root), 10)
+        self.pending_media = []
+        self.planner = a.planner if a.planner != "auto" else cfg.get("planner") or \
+            planners.pick_primary_planner(self.enabled_planners, self._effective_usage(), have_credentials())
+        self.planner_chat = None  # the cloud CLI conversation, when [c] goes through an account login
+
+    def _effective_usage(self):
+        detected = planners.detect_account_usage()
+        eff = {}
+        for k in planners.PLANNERS:
+            u = dict(self.planner_usage.get(k) or {"used": 0, "quota_left": 100.0, "quota_manual": False})
+            d = detected.get(k) or {}
+            u["used_5h"] = int(d.get("used_5h", 0))
+            u["used_24h"] = int(d.get("used_24h", 0))
+            if not u.get("quota_manual"):
+                u["quota_left"] = float(d.get("est_quota_left", 100.0))
+            eff[k] = u
+        return eff
+
+    def _record_planner_usage(self, planner_id):
+        u = self.planner_usage.setdefault(planner_id, {"used": 0, "quota_left": 100.0, "quota_manual": False})
+        u["used"] = int(u.get("used", 0)) + 1
+        try:
+            save_config(planner_usage=self.planner_usage)
+        except OSError:
+            pass
+
+    def _providers_summary(self, primary):
+        avail = set(planners.available_planners(have_credentials()))
+        eff = self._effective_usage()
+        lines = []
+        for k, label in planners.PLANNERS.items():
+            if k == primary or k not in avail or not self.enabled_planners.get(k, False):
+                continue
+            m = self.planner_models.get(k) or (self.a.model if k == "api" else "default")
+            ef = self.planner_efforts.get(k) or (self.a.effort if k == "api" else "default")
+            q = eff.get(k, {}).get("quota_left", 100.0)
+            lines.append(f'- "{k}" ({label}): model={m}, effort={ef}, usage_left={q:.0f}%')
+        return "\n".join(lines)
 
     # --- project notes ---
 
@@ -527,19 +586,66 @@ class App:
             self.client = anthropic.Anthropic()
         return True
 
-    def login_turn(self, text, solo=False):
-        """[c] and [h] through Claude Code or Codex, signed in with the user's account."""
+    def delegate_cloud(self, task_text, meta):
+        prov = (meta.get("provider") or "").strip().lower()
+        avail = set(planners.available_planners(have_credentials()))
+        if prov not in avail or not self.enabled_planners.get(prov, False):
+            return self.delegate(task_text)
+        model = meta.get("model") or self.planner_models.get(prov) or None
+        effort = meta.get("effort") or self.planner_efforts.get(prov) or None
+        print(f"  {CYAN}[{prov}]{OFF} {task_text.splitlines()[0][:80]}", flush=True)
+        snap = self.ws.snapshot()
+        try:
+            if prov == "api":
+                if not self.claude_ready():
+                    return "error: no Claude API key"
+                msg = self.client.messages.create(
+                    model=model or self.a.model, max_tokens=2048,
+                    messages=[{"role": "user", "content": task_text}],
+                )
+                reply = "".join(b.text for b in msg.content if b.type == "text")
+            else:
+                chat = planners.Planner(prov, self.ws.root, model=model, effort=effort,
+                                        solo=True, allow_shell=self.mode == "auto")
+                self.planner_chat = chat
+                try:
+                    reply = chat.ask(task_text)
+                finally:
+                    self.planner_chat = None
+            self._record_planner_usage(prov)
+            for path, old, new in self.ws.changes_since(snap):
+                if new is None:
+                    print(f"  {CYAN}[{prov}] deleted {path}{OFF}")
+                else:
+                    print(f"  {CYAN}[{prov}]{OFF}", end="")
+                    show_diff(path, old, new)
+            return reply or "(no reply)"
+        except Exception as e:
+            return f"error from {prov}: {e}"
+
+    def login_turn(self, text, solo=False, planner_id=None, media_items=None):
+        """[c] and [h] through a cloud CLI, signed in with the user's account."""
+        p = planner_id or self.planner
+        imgs = [m["path"] for m in (media_items or []) if str(m.get("mime", "")).startswith("image/")]
         chat = self.planner_chat
-        if chat is None or chat.planner != self.planner or chat.solo != solo:
-            chat = self.planner_chat = planners.Planner(self.planner, self.ws.root, solo=solo)
+        if chat is None or chat.planner != p or chat.solo != solo or imgs:
+            chat = self.planner_chat = planners.Planner(
+                p, self.ws.root,
+                model=self.planner_models.get(p) or None,
+                effort=self.planner_efforts.get(p) or None,
+                solo=solo, allow_shell=self.mode == "auto",
+                providers_info=self._providers_summary(p),
+                cloud_ratio=self.cloud_ratio, images=imgs,
+            )
         chat.allow_shell = self.mode == "auto"
-        print(f"{DIM}  {planners.PLANNERS[self.planner]} is {'working' if solo else 'planning'} ...{OFF}", flush=True)
+        print(f"{DIM}  {planners.PLANNERS[p]} is {'working' if solo else 'planning'} ...{OFF}", flush=True)
         snap = [None]
 
         def before_turn():  # the tool edits on its own: compare the workspace around each of its turns
             snap[0] = self.ws.snapshot()
 
         def after_turn():
+            self._record_planner_usage(p)
             for path, old, new in self.ws.changes_since(snap[0]):
                 mark = "" if solo else f"  {CYAN}[c]{OFF}"
                 if new is None:
@@ -554,21 +660,38 @@ class App:
 
         try:
             planners.run(chat, text, self.delegate, lambda t: print(t, flush=True), on_plan=on_plan,
-                         before_turn=before_turn, after_turn=after_turn)
+                         before_turn=before_turn, after_turn=after_turn, delegate_cloud=self.delegate_cloud)
         except KeyboardInterrupt:
             chat.stop()
             print(f"\n{YELLOW}[interrupted]{OFF}")
 
-    def claude_turn(self, text, solo=False):
-        if self.planner != "api":
-            return self.login_turn(text, solo)
+    def claude_turn(self, text, solo=False, media_items=None):
+        active_p = planners.pick_task_planner(text, self.enabled_planners, self._effective_usage(),
+                                              have_credentials(), media=media_items) if self.mix_auto else self.planner
+        if active_p != "api":
+            return self.login_turn(text, solo, planner_id=active_p, media_items=media_items)
         if not self.claude_ready():
             return
+        self._record_planner_usage("api")
         mark = len(self.messages)
         an = self.anthropic
         self.by = "" if solo else "c"
         try:
-            self.architect_turn(text, solo)
+            imgs = [m for m in (media_items or []) if str(m.get("mime", "")).startswith("image/")]
+            if imgs:
+                blocks = []
+                for m in imgs:
+                    try:
+                        with open(m["path"], "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode("ascii")
+                        blocks.append({"type": "image", "source": {"type": "base64", "media_type": m["mime"], "data": b64}})
+                    except OSError:
+                        continue
+                blocks.append({"type": "text", "text": text})
+                self.messages.append({"role": "user", "content": blocks})
+                self.architect_turn(text, solo)
+            else:
+                self.architect_turn(text, solo)
         except KeyboardInterrupt:
             del self.messages[mark:]
             print(f"\n{YELLOW}[interrupted; that request was dropped from Claude's conversation]{OFF}")
@@ -591,7 +714,7 @@ class App:
 
     # --- one request ---
 
-    def attach(self, text):
+    def attach(self, text, media_items=None):
         """Appends the content of each @path that names a workspace file."""
         out = text
         for ref in dict.fromkeys(re.findall(r"(?<!\S)@([^\s@]+)", text)):
@@ -600,27 +723,44 @@ class App:
             except ValueError:
                 continue
             if os.path.isfile(p):
-                with open(p, encoding="utf-8", errors="replace") as f:
-                    out += f"\n\n<file path=\"{self.ws.rel(p)}\">\n{clip(f.read())}\n</file>"
+                if os.path.splitext(p)[1].lower() in MEDIA_EXTS:
+                    out += f"\n\n<attached_media path=\"{self.ws.rel(p)}\" />"
+                else:
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        out += f"\n\n<file path=\"{self.ws.rel(p)}\">\n{clip(f.read())}\n</file>"
                 print(f"{DIM}  attached {self.ws.rel(p)}{OFF}")
+        for m in (media_items or []):
+            rel = os.path.relpath(m["path"], self.ws.root) if m["path"].startswith(self.ws.root) else m["path"]
+            out += f"\n\n<attached_media path=\"{rel}\" mime=\"{m['mime']}\" />"
         return out
 
     def turn(self, text, prompt=DIRECT_PROMPT):
-        """Routes one request: "[c]" the cloud model alone, "[h]" hybrid (it plans, the local model works),
-        "[l]" or no prefix the local model alone."""
+        """Routes one request: "[c]" cloud, "[h]"/"[m]" mix, "[l]" local, or by project cloud_ratio."""
         tag, rest = text[:3].lower(), text[3:].strip()
         if tag == "[m]":  # mix: the other name of the hybrid mode
             tag = "[h]"
         if tag not in ("[c]", "[l]", "[h]"):
-            tag, rest = "[l]", text
-        if not rest:
+            tag = "[l]" if self.cloud_ratio <= 0 else "[c]" if self.cloud_ratio >= 100 else "[h]"
+            rest = text
+        media_items = list(self.pending_media)
+        self.pending_media.clear()
+        if media_items and tag == "[l]":
+            tag = "[h]"
+            print(f"{DIM}Media attached: routing to multimodal Cloud AI.{OFF}")
+        if not rest and not media_items:
             return
+        if not rest and media_items:
+            rest = "Please inspect the attached media."
         self.ws.begin_turn()
         try:
+            if tag == "[c]" and self.engine is not None:
+                self.close()
+                self.local_open = False
+                print(f"{DIM}Cloud 100%: unloaded local model to free RAM and VRAM.{OFF}")
             if tag in ("[c]", "[h]"):
-                self.claude_turn(self.attach(rest), solo=tag == "[c]")
+                self.claude_turn(self.attach(rest, media_items), solo=tag == "[c]", media_items=media_items)
             else:
-                self.local_turn(self.attach(rest), prompt)
+                self.local_turn(self.attach(rest, media_items), prompt)
         finally:
             if self.ws.backups:
                 self.undo.append((rest.splitlines()[0][:60], self.ws.backups))
@@ -708,11 +848,100 @@ class App:
         elif name == "/key":
             if ask_for_key():
                 self.client = None  # the next [c] request builds a client with the new key
+        elif name == "/cloud":
+            if not arg:
+                print(f"cloud share: {self.cloud_ratio}% (0=local, 100=cloud only)")
+            else:
+                try:
+                    self.cloud_ratio = max(0, min(100, int(arg.rstrip("%"))))
+                    self.project_cloud_ratio[os.path.realpath(self.ws.root)] = self.cloud_ratio
+                    save_config(project_cloud_ratio=self.project_cloud_ratio)
+                    if self.cloud_ratio >= 100 and self.engine is not None:
+                        self.close()
+                        self.local_open = False
+                        print(f"{DIM}unloaded local model to free RAM and VRAM{OFF}")
+                    print(f"cloud share: {self.cloud_ratio}%")
+                except ValueError:
+                    print(f"{RED}usage: /cloud [0-100]{OFF}")
+        elif name == "/providers":
+            parts = arg.split()
+            if len(parts) == 2 and parts[0] in ("enable", "disable") and parts[1] in planners.PLANNERS:
+                self.enabled_planners[parts[1]] = (parts[0] == "enable")
+                save_config(enabled_planners=self.enabled_planners)
+            elif arg == "auto":
+                self.mix_auto = not self.mix_auto
+                save_config(mix_auto=self.mix_auto)
+                print(f"mix auto-select: {'on' if self.mix_auto else 'off'}")
+            avail = set(planners.available_planners(have_credentials()))
+            eff = self._effective_usage()
+            primary = planners.pick_primary_planner(self.enabled_planners, eff, have_credentials())
+            for k, label in planners.PLANNERS.items():
+                st_str = "not installed" if k not in avail else ("primary" if k == primary else ("activated" if self.enabled_planners.get(k) else "disabled"))
+                u = eff[k]
+                print(f"  {k:<12} {st_str:<14} {u['quota_left']:5.1f}% left  (5h: {u['used_5h']}, 24h: {u['used_24h']})  {DIM}{label}{OFF}")
+        elif name == "/paste":
+            items = read_clipboard_media(os.path.join(self.ws.root, ".sicode", "uploads"))
+            if not items:
+                print(f"{DIM}no image or video found in clipboard{OFF}")
+            else:
+                self.pending_media.extend(items)
+                print(f"{DIM}attached from clipboard: {', '.join(it['name'] for it in items)}{OFF}")
         else:
             print(f"{RED}unknown command {name}; /help lists them{OFF}")
         return True
 
     def read_request(self):
+        if os.name == "nt" and sys.stdin.isatty():
+            import msvcrt
+            lines = []
+            while True:
+                prompt_str = f"\n{GREEN}>{OFF} " if not lines else f"{DIM}.{OFF} "
+                sys.stdout.write(prompt_str)
+                sys.stdout.flush()
+                buf = []
+                while True:
+                    ch = msvcrt.getwch()
+                    if ch in ("\r", "\n"):
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        break
+                    if ch == "\x03":
+                        raise KeyboardInterrupt
+                    if ch in ("\x08", "\x7f"):
+                        if buf:
+                            buf.pop()
+                            sys.stdout.write("\b \b")
+                            sys.stdout.flush()
+                        continue
+                    if ch == "\x1b":
+                        if msvcrt.kbhit():
+                            nxt = msvcrt.getwch()
+                            if nxt.lower() == "v":
+                                items = read_clipboard_media(os.path.join(self.ws.root, ".sicode", "uploads"))
+                                if items:
+                                    self.pending_media.extend(items)
+                                    sys.stdout.write(f" {DIM}[+{len(items)} media]{OFF}")
+                                    sys.stdout.flush()
+                        continue
+                    if ch in ("\x00", "\xe0"):
+                        if msvcrt.kbhit():
+                            sc = msvcrt.getwch()
+                            if sc == "/":
+                                items = read_clipboard_media(os.path.join(self.ws.root, ".sicode", "uploads"))
+                                if items:
+                                    self.pending_media.extend(items)
+                                    sys.stdout.write(f" {DIM}[+{len(items)} media]{OFF}")
+                                    sys.stdout.flush()
+                        continue
+                    buf.append(ch)
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
+                line = "".join(buf)
+                if line.endswith("\\"):
+                    lines.append(line[:-1])
+                    continue
+                lines.append(line)
+                return "\n".join(lines).strip()
         lines = []
         while True:
             line = input(f"\n{GREEN}>{OFF} " if not lines else f"{DIM}.{OFF} ")
@@ -780,8 +1009,9 @@ def main():
     ap.add_argument("--backend", default="vulkan", choices=["vulkan", "cpu"], help="where the local model runs")
     ap.add_argument("-p", "--prompt", help="run one request and exit; may start with [l] local, [c] cloud or [m] mix")
     ap.add_argument("--planner", default="auto", choices=["auto", *planners.PLANNERS],
-                    help="who plans [c] requests: the Claude API key, or an account login through Claude Code, Codex "
-                         "or Antigravity (default: the last choice, else an installed login tool)")
+                    help="who plans [c] requests: the Claude API key, or an account login through a local CLI "
+                         "(default: auto-selected by remaining usage and task)")
+    ap.add_argument("--cloud", type=int, default=None, help="cloud AI share %% for this session (0=local, 100=cloud only)")
     ap.add_argument("--web", action="store_true", help="open SiCode as a page in the browser instead of the terminal")
     ap.add_argument("--port", type=int, default=8765, help="port of the --web page (default 8765; 0 picks a free one)")
     ap.add_argument("--no-browser", action="store_true", help="with --web: print the address, do not open it")

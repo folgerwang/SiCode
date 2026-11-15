@@ -162,6 +162,11 @@ dialog pre { margin: 0; font: 12.5px/1.5 var(--mono); white-space: pre; }
 dialog label { display: block; font-size: 12.5px; color: var(--dim); margin: 12px 0 4px; }
 dialog label:first-child { margin-top: 0; }
 dialog input[type=text], dialog input[type=password], dialog select { width: 100%; border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 7px 10px; }
+.ptbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.ptbl th, .ptbl td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; white-space: nowrap; }
+.ptbl th { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); background: rgba(0,0,0,.02); }
+.ptbl tr:last-child td { border-bottom: none; }
+.ptbl select, .ptbl input[type=number] { padding: 3px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); font-size: 12px; width: auto; }
 .dir { padding: 5px 8px; border-radius: 6px; cursor: pointer; display: flex; gap: 8px; } .dir:hover { background: var(--line); }
 .dir.file { color: var(--dim); cursor: default; } .dir.file:hover { background: none; } .dir .ic { flex: none; width: 1.3em; text-align: center; }
 
@@ -187,16 +192,14 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
   <div id="scroll"><div id="feed"></div></div>
   <div id="compose">
     <div id="box">
-      <textarea id="text" rows="1" placeholder="Describe a task, or ask about this folder"></textarea>
+      <textarea id="text" rows="1" placeholder="Describe a task, or ask about this folder (paste or drop images/videos)"></textarea>
+      <div id="mediaprev" style="display:none;flex-wrap:wrap;gap:6px;padding:0 12px 6px"></div>
       <div id="bar">
-        <div class="seg" id="route" role="group" aria-label="Who handles the request">
-          <button data-r="local" title="The local Qwen3.8-Flash-Next does everything, on your GPU">Local</button>
-          <button data-r="hybrid" id="hybridbtn" class="on">Mix</button>
-          <button data-r="cloud" id="cloudbtn">Claude</button>
-        </div>
+        <button id="attach" class="ghost" title="Attach image or video">+ Media</button>
+        <input type="file" id="mediafile" accept="image/*,video/*" multiple hidden>
         <select id="mode" title="Permissions"></select>
-        <div id="alloc" title="Project task allocation: left = more Local, right = more Cloud" style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);margin-left:4px">
-          <span>Local</span><input type="range" id="cloudmix" min="0" max="100" step="5" value="50" style="width:84px;accent-color:var(--accent)"><span>Cloud</span><b id="cloudmixv" style="color:var(--text);min-width:32px">50%</b>
+        <div id="alloc" title="Cloud AI share for this project (0% = Local only, 100% = Cloud only & unload local model)" style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);margin-left:4px">
+          <span>Cloud</span><input type="range" id="cloudmix" min="0" max="100" step="5" value="10" style="width:96px;accent-color:var(--accent)"><b id="cloudmixv" style="color:var(--text);min-width:34px">10%</b><span id="allocmode" class="dim"></span>
         </div>
         <span class="sp"></span>
         <button id="restart" title="Force stop if running and re-run the last request" hidden>Restart</button>
@@ -204,7 +207,7 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
         <button id="send" class="primary">Send</button>
       </div>
     </div>
-    <div id="hint">Enter sends, Shift+Enter adds a line. @path attaches a file from the folder.</div>
+    <div id="hint">Enter sends, Shift+Enter adds a line. @path attaches a file; Alt+V / Ctrl+V pastes image or video.</div>
   </div>
 </main>
 
@@ -222,11 +225,11 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
   <div id="recent"></div>
   <label>In this folder</label><div id="dirs" style="max-height:38vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:4px"></div></div><div class="df"><span class="dim" id="direrr" style="flex:1;font-size:12.5px;align-self:center"></span><button class="primary" id="usedir">Start a task here</button></div></dialog>
 <dialog id="setdlg"><div class="dh"><h3>Settings</h3><button class="ghost" data-close>Close</button></div><div class="db">
-  <label for="planner">Primary cloud model (or auto-selected by most usage left in Mix mode)</label><select id="planner"></select>
+  <label for="planner">Primary cloud model (auto-selected dynamically by ML router when Dynamic mode is on)</label><select id="planner"></select>
   <div class="dim" id="plannernote" style="font-size:12.5px;margin-top:6px"></div>
-  <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text)"><input type="checkbox" id="mixauto" style="width:auto"> Mix mode: auto-select primary provider with most usage left &amp; mix activated models/thinking levels</label>
+  <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text)"><input type="checkbox" id="mixauto" style="width:auto"> Dynamic cloud selection: auto-select primary provider &amp; effort from our trained ML model</label>
   <label>Installed cloud AI CLI providers (activated when found locally; toggle to use or skip, and set usage left %)</label>
-  <div id="providerlist" style="display:flex;flex-direction:column;gap:6px;border:1px solid var(--line);border-radius:8px;padding:8px"></div>
+  <div id="providerlist" style="border:1px solid var(--line);border-radius:8px;overflow:auto"></div>
   <label for="localmodel">Local model</label><select id="localmodel"></select>
   <div class="dim" id="localnote" style="font-size:12.5px;margin-top:6px"></div>
   <label for="vramcap">Most VRAM in use on the card, in GB, counting other programs (0 = no cap)</label><input type="text" id="vramcap" inputmode="decimal" autocomplete="off">
@@ -234,8 +237,6 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
   <label for="watchdog">Cloud AI monitor for long local jobs, in minutes (0 = off; default 10)</label><input type="text" id="watchdog" inputmode="decimal" autocomplete="off">
   <div class="dim" style="font-size:12.5px;margin-top:6px">When a local job runs longer than this, the selected cloud model checks its progress and decides whether to wait or force-stop it.</div>
   <label for="key">Claude API key (only for the "Claude API key" planner; saved in ~/.sicode/config.json)</label><input type="password" id="key" placeholder="sk-ant-..." autocomplete="off">
-  <label for="model" id="modellbl">Claude model (Claude API key planner)</label><select id="model"><option value="claude-opus-5-5">Claude Opus 5.5</option><option value="claude-fable-5-1">Claude Fable 5.1</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5</option><option value="claude-haiku-5-5">Claude Haiku 5.5</option></select>
-  <label for="effort" id="effortlbl">Claude reasoning effort</label><select id="effort"><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select>
 </div><div class="df"><button class="primary" id="saveset">Save</button></div></dialog>
 
 <script>
@@ -333,13 +334,18 @@ function view(it) {
   const w = el('div', 'it' + (it.sub ? ' sub' : ''));
   if (it.type === 'user') {
     const b = el('div', 'user', it.text);
+    if (it.media && it.media.length) {
+      const mr = el('div'); mr.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px';
+      for (const m of it.media) mr.append(el('span', 'chip', (m.mime && m.mime.startsWith('video/') ? '🎬 ' : '🖼 ') + (m.name || m.rel)));
+      b.append(mr);
+    }
     if (it.route === 'hybrid' || it.route === 'claude') b.append(el('span', 'via', 'mix: steps marked [l] run on the local model, [c] in the cloud'));
     else if (it.route === 'cloud') b.append(el('span', 'via', 'cloud: done by the cloud model'));
     w.style.display = 'flex'; w.style.justifyContent = 'flex-end';
     w.append(b);
   } else if (it.type === 'assistant') {
     const a = el('div', 'assistant');
-    if (it.who === 'claude' || it.who === 'codex' || it.who === 'agy') a.append(el('div', 'who', {codex: 'Codex', agy: 'Antigravity'}[it.who] || 'Claude'));
+    if (it.who && it.who !== 'local') a.append(el('div', 'who', {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[it.who] || 'Claude'));
     const body = el('div', 'md'); body.innerHTML = md(it.text || '');
     a.append(body); w.append(a);
   } else if (it.type === 'think') {
@@ -443,12 +449,21 @@ function taskElapsed(t) {
   if (t.started && st && st.busy === t.id) sec += Math.max(0, Date.now() / 1000 - t.started);
   return sec;
 }
+function isBusy(id) {
+  if (!st || !id) return false;
+  const list = st.busy_tasks || (st.busy ? [st.busy] : []);
+  return list.includes(id);
+}
+function anyBusy() {
+  if (!st) return false;
+  return (st.busy_tasks ? st.busy_tasks.length : (st.busy ? 1 : 0)) > 0;
+}
 function updateTimers() {
   if (!st) return;
   for (const elTm of document.querySelectorAll('#tasks .tm[data-id]')) {
     const t = st.tasks.find(x => x.id === elTm.dataset.id);
     const sec = taskElapsed(t);
-    elTm.textContent = (sec > 0 || (t && st.busy === t.id)) ? fmtDur(sec) : '';
+    elTm.textContent = (sec > 0 || (t && isBusy(t.id))) ? fmtDur(sec) : '';
   }
   for (const elItm of document.querySelectorAll('#feed .itm[data-ts]')) {
     const ts = parseFloat(elItm.dataset.ts);
@@ -457,14 +472,14 @@ function updateTimers() {
   const curTask = st.tasks.find(x => x.id === cur);
   const tt = $('tasktime');
   const curSec = taskElapsed(curTask);
-  if (curTask && (curSec > 0 || st.busy === cur)) {
+  if (curTask && (curSec > 0 || isBusy(cur))) {
     tt.hidden = false;
-    tt.textContent = (st.busy === cur ? 'Running ' : 'Time ') + fmtDur(curSec);
+    tt.textContent = (isBusy(cur) ? 'Running ' : 'Time ') + fmtDur(curSec);
   } else {
     tt.hidden = true;
   }
 }
-setInterval(() => { if (st && st.busy) updateTimers(); }, 1000);
+setInterval(() => { if (anyBusy()) updateTimers(); }, 1000);
 
 function renderSide() {
   $('ver').textContent = 'v' + st.version;
@@ -472,7 +487,7 @@ function renderSide() {
   if (st.tasks.length) box.append(el('div', 'label', 'Tasks'));
   for (const t of st.tasks) {
     const d = el('div', 'task' + (t.id === cur ? ' on' : ''));
-    if (st.busy === t.id) d.append(el('span', 'spin'));
+    if (isBusy(t.id)) d.append(el('span', 'spin'));
     const name = el('span', 't', t.title); name.title = t.title + '\n' + t.workspace;
     const tm = el('span', 'tm'); tm.dataset.id = t.id;
     const x = el('button', 'ghost x', '×'); x.title = 'Delete this task';
@@ -487,40 +502,77 @@ function renderBar() {
   const m = $('mode');
   if (!m.options.length) for (const k of Object.keys(st.modes)) m.append(new Option({ask: 'Ask before changes', edits: 'Ask before commands', auto: 'Never ask'}[k] || k, k));
   m.value = st.mode; m.title = st.modes[st.mode];
-  const plId = (route === 'hybrid' && st.mix_auto && st.primary_planner) ? st.primary_planner : st.planner;
-  const pl = st.planners.find(x => x.id === plId) || st.planners[0];
-  const brand = {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini', opencode: 'OpenCode', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[plId] || 'Claude';
-  $('cloudbtn').textContent = brand;
-  $('cloudbtn').title = brand + ' does the work itself (' + pl.label + '). The local model is not used.' +
-    (st.planner === 'api' ? '' : ' Its file changes are applied directly and shown afterwards; Undo puts them back.');
-  $('hybridbtn').title = brand + ' (' + pl.label + ') splits the job: steps marked [l] go to the local model, steps marked [c] it does itself.';
-  const mine = st.busy && st.busy === cur, b = $('send');
-  b.textContent = mine ? 'Stop' : 'Send'; b.className = mine ? '' : 'primary'; b.disabled = !cur || (!!st.busy && !mine);
-  $('forcestop').hidden = !st.busy;
-  const hasUser = items.some(it => it && it.type === 'user');
-  $('restart').hidden = !(mine || (cur && hasUser && !st.busy));
   const curTask = st.tasks.find(x => x.id === cur);
-  const ratio = curTask ? ((st.project_cloud_ratio || {})[curTask.workspace] ?? 50) : 50;
+  const ratio = curTask ? ((st.project_cloud_ratio || {})[curTask.workspace] ?? 10) : 10;
+  route = ratio <= 0 ? 'local' : ratio >= 100 ? 'cloud' : 'hybrid';
+  const plId = (route === 'hybrid' && st.mix_auto && st.primary_planner) ? st.primary_planner : st.planner;
+  const brand = {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[plId] || 'Claude';
+  const mine = isBusy(cur), b = $('send');
+  b.textContent = mine ? 'Stop' : 'Send'; b.className = mine ? '' : 'primary'; b.disabled = !cur;
+  $('forcestop').hidden = !mine;
+  const hasUser = items.some(it => it && it.type === 'user');
+  $('restart').hidden = !(mine || (cur && hasUser));
   $('cloudmix').value = ratio; $('cloudmixv').textContent = ratio + '%';
+  $('allocmode').textContent = ratio <= 0 ? '(Local)' : ratio >= 100 ? '(' + brand + ' only)' : '(Mix · ' + brand + ')';
   updateTimers();
-  $('undo').disabled = !undoN || !!st.busy; $('compact').disabled = !!st.busy || st.ctx_task !== cur;
+  $('undo').disabled = !undoN || mine; $('compact').disabled = mine || st.ctx_task !== cur;
   const c = $('context'); c.textContent = '';
   const used = st.ctx_task === cur ? st.ctx_used : 0;
   if (st.engine) {
     const meter = el('div', 'meter'); meter.append(Object.assign(el('i'), {style: 'width:' + Math.max(0.5, 100 * used / st.ctx).toFixed(1) + '%'}));
     c.append(kv('Local context', used.toLocaleString() + ' of ' + st.ctx.toLocaleString()), meter);
   } else c.append(kv('Local context', 'the model loads with the first request'));
-  c.append(kv('Local tokens written', st.usage.local.toLocaleString()));
-  if (st.usage.in || st.usage.out) c.append(kv('Claude tokens', st.usage.in.toLocaleString() + ' in, ' + st.usage.out.toLocaleString() + ' out'));
+  const cloudTok = (st.usage.in || 0) + (st.usage.out || 0) + (st.usage.cloud_est || 0);
+  const totalTok = (st.usage.local || 0) + cloudTok;
+  c.append(kv('Combined usage', totalTok.toLocaleString() + ' tok (' + (st.usage.local || 0).toLocaleString() + ' local + ' + cloudTok.toLocaleString() + ' cloud)'));
+  if (st.usage.tok_per_min) c.append(kv('Token rate', Math.round(st.usage.tok_per_min).toLocaleString() + ' tok/min'));
+  if (st.usage.cost_usd) c.append(kv('Est. cost', '$' + st.usage.cost_usd.toFixed(4)));
+  if (st.usage.in || st.usage.out) c.append(kv('Claude API', st.usage.in.toLocaleString() + ' in, ' + st.usage.out.toLocaleString() + ' out'));
+  if (st.ml_summary && st.ml_summary.length) {
+    const top = st.ml_summary[0];
+    c.append(kv('ML router top', top.arm + ' (eff ' + top.efficiency.toFixed(2) + ', ' + Math.round(top.tok_s) + ' tok/s)'));
+  }
+  const activeN = (st.busy_tasks || []).length;
+  if (activeN > 1) c.append(kv('Active projects', activeN + ' running'));
   const lmNow = st.local_models.find(m => m.path === st.local_model);
   c.append(kv('Local model', lmNow ? lmNow.label : st.local_model.split(/[\\/]/).slice(-2).join('/')));
-  const pm = (st.planner_models || {})[st.planner] || '';
-  const pe = (st.planner_efforts || {})[st.planner] || '';
+  const activeCloud = (st.mix_auto !== false && st.primary_planner) ? st.primary_planner : st.planner;
+  const pm = (st.planner_models || {})[activeCloud] || '';
+  const pe = (st.mix_auto !== false && st.primary_effort) ? st.primary_effort : ((st.planner_efforts || {})[activeCloud] || '');
   const agyLabel = (st.agy_models || []).find(m => m.id === pm)?.label || pm || 'Antigravity (default)';
-  const pLabel = st.planner === 'api' ? st.model.replace('claude-', '') + ' (' + st.effort + ')'
-    : st.planner === 'agy' ? agyLabel + (pe ? ' (' + pe + ')' : '')
-    : (pm ? pm + (pe ? ' (' + pe + ')' : '') : ((st.planners.find(x => x.id === st.planner) || {}).label || st.planner) + (pe ? ' (' + pe + ')' : ''));
-  c.append(kv('Cloud model', pLabel));
+  const pLabel = activeCloud === 'api' ? st.model.replace('claude-', '') + ' (' + (pe || st.effort) + ')'
+    : activeCloud === 'agy' ? agyLabel + (pe ? ' (' + pe + ')' : '')
+    : (pm ? pm + (pe ? ' (' + pe + ')' : '') : ((st.planners.find(x => x.id === activeCloud) || {}).label || activeCloud) + (pe ? ' (' + pe + ')' : ''));
+  c.append(kv('Cloud model', (st.mix_auto !== false ? 'ML Auto · ' : '') + pLabel));
+  const enabledCloud = (st.planners || []).filter(p => p.installed && p.enabled);
+  if (enabledCloud.length) {
+    const hdr = el('div', 'kv'); hdr.style.marginTop = '6px';
+    hdr.append(el('span', '', 'Cloud usage'), el('b', '', enabledCloud.length + ' active'));
+    c.append(hdr);
+    for (const p of enabledCloud) {
+      const u = p.usage || {};
+      const q = u.quota_left != null ? Math.round(u.quota_left) : 100;
+      const u5 = u.used_5h || 0, u24 = u.used_24h || 0, uSi = u.used || 0;
+      const detail = q + '% left' + (u5 || u24 ? ' · ' + u5 + '/5h · ' + u24 + '/24h' : (uSi ? ' · ' + uSi + ' runs' : ''));
+      const row = kv('· ' + p.label, detail);
+      row.style.paddingLeft = '6px';
+      c.append(row);
+    }
+  }
+  const projModels = curTask && st.project_models ? (st.project_models[curTask.workspace] || []) : [];
+  if (projModels.length) {
+    const mHdr = el('div', 'kv'); mHdr.style.marginTop = '6px';
+    mHdr.append(el('span', '', 'Models used (project)'), el('b', '', projModels.length + ''));
+    c.append(mHdr);
+    for (const m of projModels) {
+      const parts = [m.runs + 'x'];
+      if (m.tokens) parts.push(m.tokens.toLocaleString() + ' tok');
+      if (m.cost) parts.push('$' + m.cost.toFixed(4));
+      const row = kv('· ' + m.model, parts.join(' · '));
+      row.style.paddingLeft = '6px';
+      c.append(row);
+    }
+  }
 }
 function kv(k, v) { const d = el('div', 'kv'); d.append(el('span', '', k), el('b', '', v)); return d; }
 function renderChanged() {
@@ -604,13 +656,45 @@ function pick() {
   const t = st.tasks.find(x => x.id === saved) || st.tasks[0];
   if (t) openTask(t.id); else newTask(st.default_workspace);
 }
+let pendingMedia = [];
+function renderMediaPrev() {
+  const box = $('mediaprev'); box.textContent = '';
+  box.style.display = pendingMedia.length ? 'flex' : 'none';
+  pendingMedia.forEach((m, idx) => {
+    const chip = el('span', 'chip');
+    chip.style.cssText = 'display:inline-flex;align-items:center;gap:6px;padding:3px 8px';
+    if (m.mime.startsWith('image/')) {
+      const img = Object.assign(el('img'), {src: m.data_b64});
+      img.style.cssText = 'width:24px;height:24px;object-fit:cover;border-radius:4px';
+      chip.append(img);
+    } else {
+      chip.append(el('span', '', '🎬'));
+    }
+    const rm = el('button', 'ghost', '×'); rm.style.padding = '0 4px';
+    rm.onclick = () => { pendingMedia.splice(idx, 1); renderMediaPrev(); };
+    chip.append(el('span', '', m.name), rm);
+    box.append(chip);
+  });
+}
+function addMediaFiles(files) {
+  for (const f of files) {
+    if (!f || (!f.type.startsWith('image/') && !f.type.startsWith('video/'))) continue;
+    const rd = new FileReader();
+    rd.onload = () => { pendingMedia.push({name: f.name || 'pasted', mime: f.type, data_b64: rd.result}); renderMediaPrev(); };
+    rd.readAsDataURL(f);
+  }
+}
 async function send() {
   const box = $('text'), text = box.value.trim();
-  if (st.busy === cur) { api('/api/stop', {}); return; }
-  if (!text || !cur || st.busy) return;
-  box.value = ''; grow();
-  const r = await api('/api/send', {task: cur, text, route});
-  if (r.error) { box.value = text; alert(r.error); }
+  if (isBusy(cur)) { api('/api/stop', {task: cur}); return; }
+  if ((!text && !pendingMedia.length) || !cur) return;
+  const ratio = parseInt($('cloudmix').value, 10) || 0;
+  route = ratio <= 0 ? 'local' : ratio >= 100 ? 'cloud' : 'hybrid';
+  const media = pendingMedia.map(m => ({name: m.name, mime: m.mime, data_b64: m.data_b64 || '', path: m.path || ''}));
+  const savedMedia = pendingMedia.slice();
+  box.value = ''; grow(); pendingMedia = []; renderMediaPrev();
+  const r = await api('/api/send', {task: cur, text, route, media});
+  if (r.error) { box.value = text; pendingMedia = savedMedia; renderMediaPrev(); alert(r.error); }
 }
 function grow() { const t = $('text'); t.style.height = 'auto'; t.style.height = Math.min(220, t.scrollHeight) + 'px'; }
 
@@ -642,31 +726,66 @@ function connect() {
 // --- wiring ---
 $('new').onclick = () => chooseFolder();  // a new task starts with choosing its folder
 $('send').onclick = send;
-$('cloudmix').oninput = () => { $('cloudmixv').textContent = $('cloudmix').value + '%'; };
+$('attach').onclick = () => $('mediafile').click();
+$('mediafile').onchange = e => { addMediaFiles(e.target.files); e.target.value = ''; };
+$('box').addEventListener('dragover', e => { e.preventDefault(); });
+$('box').addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer && e.dataTransfer.files) addMediaFiles(e.dataTransfer.files); });
+$('text').addEventListener('paste', e => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  const files = [];
+  for (const it of items) { if (it.kind === 'file') { const f = it.getAsFile(); if (f) files.push(f); } }
+  if (files.length) addMediaFiles(files);
+});
+$('cloudmix').oninput = () => {
+  const r = parseInt($('cloudmix').value, 10) || 0;
+  $('cloudmixv').textContent = r + '%';
+  $('allocmode').textContent = r <= 0 ? '(Local)' : r >= 100 ? '(Cloud only)' : '(Mix)';
+};
 $('cloudmix').onchange = async () => {
   const curTask = st && st.tasks.find(x => x.id === cur);
   if (!curTask) return;
   await api('/api/project-mix', {workspace: curTask.workspace, ratio: parseInt($('cloudmix').value, 10)});
 };
-$('forcestop').onclick = async () => { await api('/api/force-stop', {}); };
+$('forcestop').onclick = async () => { await api('/api/force-stop', {task: cur}); };
 $('restart').onclick = async () => {
   const r = await api('/api/restart', {task: cur});
   if (r.error) alert(r.error);
 };
 $('text').addEventListener('input', grow);
-$('text').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
-$('route').onclick = e => { const b = e.target.closest('button'); if (!b) return; route = b.dataset.r; for (const x of $('route').children) x.classList.toggle('on', x === b);
-  if (route !== 'local' && st.planner === 'api' && !st.key) $('settings').click(); };
+async function pasteClipboardMedia() {
+  const r = await api('/api/clipboard-media', {task: cur || ''});
+  if (r.items && r.items.length) {
+    for (const it of r.items) pendingMedia.push(it);
+    renderMediaPrev();
+  }
+}
+$('text').addEventListener('keydown', e => {
+  if (e.altKey && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteClipboardMedia(); return; }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
 $('mode').onchange = e => api('/api/mode', {mode: e.target.value});
 $('undo').onclick = async () => { const r = await api('/api/undo', {task: cur}); if (r.error) alert(r.error); else { undoN = r.undo; renderBar(); renderTree($('tree'), ''); } };
 $('compact').onclick = () => api('/api/send', {task: cur, text: '/compact', route: 'local'});
 $('fileview').onclick = e => { const b = e.target.closest('button'); if (b) showFile(b.dataset.v); };
 document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => b.closest('dialog').close());
-function plannerNote() { const p = st.planners.find(x => x.id === $('planner').value);
-  const name = {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini CLI', opencode: 'OpenCode', codebuddy: 'CodeBuddy', tcloud: 'Tencent Cloud AI'}[p.id] || 'Claude Code';
+function plannerNote() {
+  const auto = $('mixauto').checked;
+  $('planner').disabled = auto;
+  if (auto) {
+    const pId = st.primary_planner || st.planner;
+    const pObj = st.planners.find(x => x.id === pId);
+    const pName = pObj ? pObj.label : pId;
+    const ef = st.primary_effort ? ' (' + st.primary_effort + ')' : '';
+    $('plannernote').textContent = 'Dynamic ML selection is active — current ML-selected primary: ' + pName + ef + '. Uncheck Dynamic cloud selection below to pin a fixed primary.';
+    return;
+  }
+  const p = st.planners.find(x => x.id === $('planner').value);
+  const name = {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini CLI', codebuddy: 'CodeBuddy', tcloud: 'Tencent Cloud AI'}[p.id] || 'Claude Code';
   $('plannernote').textContent = p.id === 'api' ? 'Uses the key below; billed per token by Anthropic.'
     : p.found ? 'Uses the account you are signed in with in ' + name + '; no API key is involved. It can read the folder, and hands every change to the local model.'
-    : name + ' was not found on this computer. Install it and sign in first.'; }
+    : name + ' was not found on this computer. Install it and sign in first.';
+}
 const PROVIDER_MODELS = {
   api: [['claude-opus-5-5', 'Claude Opus 5.5'], ['claude-fable-5-1', 'Claude Fable 5.1'],
         ['claude-sonnet-5-5', 'Claude Sonnet 5.5'], ['claude-haiku-5-5', 'Claude Haiku 5.5']],
@@ -677,7 +796,6 @@ const PROVIDER_MODELS = {
           ['gpt-5.2-codex', 'GPT-5.2 Codex'], ['gpt-5.1-codex-max', 'GPT-5.1 Codex Max'],
           ['o3', 'o3'], ['o4-mini', 'o4-mini']],
   gemini: [['', 'Default (gemini)'], ['gemini-2.5-pro', 'Gemini 2.5 Pro'], ['gemini-2.5-flash', 'Gemini 2.5 Flash']],
-  opencode: [['', 'Default (opencode)']],
   codebuddy: [['', 'Default (codebuddy)']],
   tcloud: [['', 'Default (tcloud)']]
 };
@@ -687,54 +805,73 @@ const PROVIDER_EFFORTS = {
   codex: ['', 'low', 'medium', 'high', 'xhigh'],
   agy: ['', 'low', 'medium', 'high', 'xhigh', 'max'],
   gemini: ['', 'low', 'medium', 'high'],
-  opencode: ['', 'low', 'medium', 'high'],
   codebuddy: ['', 'low', 'medium', 'high'],
   tcloud: ['', 'low', 'medium', 'high']
 };
-function fillCloudModels() {
-  const p = $('planner').value, m = $('model'), ef = $('effort');
-  const brand = {api: 'Claude API', 'claude-code': 'Claude Code', codex: 'Codex', agy: 'Antigravity',
-                 gemini: 'Gemini CLI', opencode: 'OpenCode', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[p] || p;
-  $('modellbl').textContent = brand + ' model';
-  $('effortlbl').textContent = brand + ' reasoning effort';
-  m.textContent = '';
-  const curModel = p === 'api' ? st.model : ((st.planner_models || {})[p] || '');
-  if (p === 'agy') {
+function makeProviderModelSelect(pId) {
+  const m = el('select');
+  m.style.cssText = 'width:155px;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);font-size:12px';
+  m.title = 'Active model'; m.dataset.mid = pId;
+  const curModel = pId === 'api' ? st.model : ((st.planner_models || {})[pId] || '');
+  if (pId === 'agy') {
     m.append(new Option('Default (agy)', ''));
     for (const x of (st.agy_models || [])) m.append(new Option(x.label, x.id));
   } else {
-    for (const [id, label] of (PROVIDER_MODELS[p] || [])) m.append(new Option(label, id));
+    for (const [id, label] of (PROVIDER_MODELS[pId] || [['', 'Default (' + pId + ')']])) m.append(new Option(label, id));
   }
   m.value = curModel;
   if (curModel && m.value !== curModel) { m.append(new Option(curModel, curModel)); m.value = curModel; }
-  ef.textContent = '';
-  for (const lvl of (PROVIDER_EFFORTS[p] || PROVIDER_EFFORTS.api)) {
-    ef.append(new Option(lvl ? lvl : 'Default (' + p + ')', lvl));
+  return m;
+}
+function makeProviderEffortSelect(pId) {
+  const ef = el('select');
+  ef.style.cssText = 'width:105px;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg);font-size:12px';
+  ef.title = 'Reasoning effort'; ef.dataset.eid = pId;
+  for (const lvl of (PROVIDER_EFFORTS[pId] || PROVIDER_EFFORTS.api)) {
+    ef.append(new Option(lvl ? lvl : 'Default', lvl));
   }
-  const curEffort = p === 'api' ? st.effort : ((st.planner_efforts || {})[p] || '');
+  const curEffort = pId === 'api' ? st.effort : ((st.planner_efforts || {})[pId] || '');
   ef.value = curEffort;
   if (curEffort && ef.value !== curEffort) { ef.append(new Option(curEffort, curEffort)); ef.value = curEffort; }
+  return ef;
 }
-$('planner').onchange = () => { plannerNote(); fillCloudModels(); };
+$('planner').onchange = () => { plannerNote(); };
+$('mixauto').onchange = () => { plannerNote(); };
 $('settings').onclick = () => { const ps = $('planner'); ps.textContent = '';
-  for (const p of st.planners) ps.append(new Option(p.label + (p.installed ? '' : ' (not installed)'), p.id)); ps.value = st.planner; plannerNote(); fillCloudModels();
-  $('mixauto').checked = st.mix_auto !== false;
+  for (const p of st.planners) ps.append(new Option(p.label + (p.installed ? '' : ' (not installed)'), p.id)); ps.value = (st.mix_auto !== false && st.primary_planner) ? st.primary_planner : st.planner;
+  $('mixauto').checked = st.mix_auto !== false; plannerNote();
   const plBox = $('providerlist'); plBox.textContent = '';
+  const tbl = el('table', 'ptbl');
+  const thead = el('thead'), hr = el('tr');
+  for (const h of ['Use', 'Provider', 'Status', 'Model', 'Effort', 'Usage Left']) hr.append(el('th', '', h));
+  thead.append(hr); tbl.append(thead);
+  const tbody = el('tbody');
   for (const p of st.planners) {
-    const row = el('div'); row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12.5px';
+    const tr = el('tr');
+    const tdUse = el('td'); tdUse.style.textAlign = 'center';
     const cb = Object.assign(el('input'), {type: 'checkbox', checked: !!p.enabled, disabled: !p.installed});
     cb.style.width = 'auto'; cb.dataset.pid = p.id;
-    const lbl = el('span', '', p.label); lbl.style.flex = '1';
+    tdUse.append(cb);
+    const tdName = el('td', '', p.label); tdName.style.fontWeight = '500';
+    const tdStat = el('td');
+    const isPrim = p.id === st.primary_planner;
     const badge = el('span', 's ' + (p.installed ? (p.enabled ? 'ok' : 'wait') : 'bad'),
-      !p.installed ? 'not installed' : p.id === st.primary_planner ? 'activated · primary' : (p.enabled ? 'activated' : 'disabled'));
+      !p.installed ? 'not installed' : isPrim ? (st.mix_auto !== false ? 'ML primary' : 'primary') : (p.enabled ? 'activated' : 'disabled'));
+    tdStat.append(badge);
+    const tdMod = el('td'); const mSel = makeProviderModelSelect(p.id); mSel.style.width = '155px'; tdMod.append(mSel);
+    const tdEff = el('td'); const eSel = makeProviderEffortSelect(p.id); eSel.style.width = '90px'; tdEff.append(eSel);
+    const tdUsePct = el('td');
+    const qWrap = el('div'); qWrap.style.cssText = 'display:inline-flex;align-items:center;gap:6px';
     const q = Object.assign(el('input'), {type: 'number', min: '0', max: '100', step: '5',
       value: (p.usage && p.usage.quota_left != null) ? p.usage.quota_left : 100});
-    q.style.cssText = 'width:62px;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg)';
-    q.title = 'Usage left (%)'; q.dataset.qid = p.id;
-    const used = el('span', 'dim', '% left (' + ((p.usage && p.usage.used) || 0) + ' used)');
-    row.append(cb, lbl, badge, q, used);
-    plBox.append(row);
+    q.style.width = '56px'; q.title = 'Usage left (%)'; q.dataset.qid = p.id;
+    const u5 = (p.usage && p.usage.used_5h) || 0, u24 = (p.usage && p.usage.used_24h) || 0, uSi = (p.usage && p.usage.used) || 0;
+    const used = el('span', 'dim', '% left' + (u5 || u24 ? ' · ' + u5 + ' (5h) / ' + u24 + ' (24h)' : ' (' + uSi + ' used)'));
+    qWrap.append(q, used); tdUsePct.append(qWrap);
+    tr.append(tdUse, tdName, tdStat, tdMod, tdEff, tdUsePct);
+    tbody.append(tr);
   }
+  tbl.append(tbody); plBox.append(tbl);
   const lm = $('localmodel'); lm.textContent = '';
   for (const m of st.local_models) lm.append(new Option(m.label + (m.default ? ' (default)' : ''), m.path));
   lm.value = st.local_model; if (lm.value !== st.local_model) { lm.append(new Option(st.local_model, st.local_model)); lm.value = st.local_model; }
@@ -753,7 +890,11 @@ $('saveset').onclick = async () => { if ($('key').value.trim()) await api('/api/
   for (const q of document.querySelectorAll('#providerlist input[data-qid]')) quota[q.dataset.qid] = parseFloat(q.value);
   await api('/api/planners', {enabled, quota, mix_auto: $('mixauto').checked});
   await api('/api/planner', {planner: $('planner').value});
-  await api('/api/model', {planner: $('planner').value, model: $('model').value, effort: $('effort').value});
+  for (const mSel of document.querySelectorAll('#providerlist select[data-mid]')) {
+    const pid = mSel.dataset.mid;
+    const eSel = document.querySelector('#providerlist select[data-eid="' + pid + '"]');
+    await api('/api/model', {planner: pid, model: mSel.value, effort: eSel ? eSel.value : ''});
+  }
   $('setdlg').close(); };
 let dirNow = '';
 async function showDirs(path) {

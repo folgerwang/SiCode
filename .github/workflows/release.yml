@@ -1,0 +1,97 @@
+name: Release Wheels (Windows / Linux / macOS)
+
+on:
+  push:
+    tags:
+      - "sicode-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. sicode-v0.2.2)"
+        required: false
+        default: "sicode-v0.2.2"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            plat: win_amd64
+            exe: qwen.exe
+            cmake_args: -DQW_NATIVE=OFF -DQW_VULKAN=OFF
+          - os: ubuntu-latest
+            plat: manylinux_2_28_x86_64
+            exe: qwen
+            cmake_args: -DQW_NATIVE=OFF -DQW_VULKAN=OFF
+          - os: macos-latest
+            plat: macosx_11_0_arm64
+            exe: qwen
+            cmake_args: -DQW_NATIVE=OFF -DQW_VULKAN=OFF
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure and build qwen engine
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+          cmake --build build --config Release --parallel
+
+      - name: Copy engine binary into sicode/bin
+        shell: python
+        run: |
+          import os, shutil, stat
+          os.makedirs("sicode/bin", exist_ok=True)
+          exe = "${{ matrix.exe }}"
+          candidates = [
+              os.path.join("build", "Release", exe),
+              os.path.join("build", exe),
+          ]
+          src = next((p for p in candidates if os.path.isfile(p)), None)
+          assert src, f"Engine binary not found in {candidates}"
+          dst = os.path.join("sicode", "bin", exe)
+          shutil.copy2(src, dst)
+          if os.name != "nt":
+              os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+      - name: Build platform wheel
+        shell: python
+        run: |
+          import glob, os, subprocess, sys
+          subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "build", "hatchling", "wheel"])
+          subprocess.check_call([sys.executable, "-m", "build", "--wheel", "--outdir", "dist"])
+          wheels = glob.glob("dist/*.whl")
+          assert len(wheels) == 1, wheels
+          src = wheels[0]
+          dst = src.replace("-any.whl", "-${{ matrix.plat }}.whl")
+          if src != dst:
+              os.replace(src, dst)
+          print("Built wheel:", dst)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.plat }}
+          path: dist/*.whl
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          files: artifacts/*.whl

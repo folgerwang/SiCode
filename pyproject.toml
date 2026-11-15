@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sicode"
-version = "0.2.1"
+version = "0.2.2"
 description = "Terminal coding assistant: Claude plans and reviews, a local Qwen3.8-Flash-Next does the work"
 readme = "sicode/README.md"
 requires-python = ">=3.10"
@@ -17,8 +17,8 @@ sicode = "sicode.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sicode"]
-# the prebuilt engine, copied to sicode/bin before building the Windows wheel (git-ignored)
-artifacts = ["sicode/bin/qwen.exe"]
+# the prebuilt engine, copied to sicode/bin before building the platform wheel (git-ignored)
+artifacts = ["sicode/bin/qwen.exe", "sicode/bin/qwen"]
 
 [tool.hatch.build.targets.sdist]
 include = ["sicode", "pyproject.toml"]

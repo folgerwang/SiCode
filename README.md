@@ -15,11 +15,16 @@ Qwen3.8-Flash-Next; `[m]` (mix) has Claude or Codex split the job between itself
 Claude or Codex do it alone. The cloud model signs in with your Claude or ChatGPT account (through Claude Code or
 Codex) or with a Claude API key.
 
-**Download:** [sicode-0.2.1-py3-none-win_amd64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.1/sicode-0.2.1-py3-none-win_amd64.whl)
-([all releases](https://github.com/folgerwang/SiCode/releases))
+**Download** ([all releases](https://github.com/folgerwang/SiCode/releases)):
+
+| Platform | Wheel | Install |
+|---|---|---|
+| **Windows (x64)** | [sicode-0.2.2-py3-none-win_amd64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.2/sicode-0.2.2-py3-none-win_amd64.whl) | `pip install sicode-0.2.2-py3-none-win_amd64.whl` |
+| **Linux (x86_64)** | [sicode-0.2.2-py3-none-manylinux_2_28_x86_64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.2/sicode-0.2.2-py3-none-manylinux_2_28_x86_64.whl) | `pip install sicode-0.2.2-py3-none-manylinux_2_28_x86_64.whl` |
+| **macOS (Apple Silicon)** | [sicode-0.2.2-py3-none-macosx_11_0_arm64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.2/sicode-0.2.2-py3-none-macosx_11_0_arm64.whl) | `pip install sicode-0.2.2-py3-none-macosx_11_0_arm64.whl` |
 
 ```
-pip install sicode-0.2.1-py3-none-win_amd64.whl
+pip install sicode-0.2.2-py3-none-win_amd64.whl
 sicode --download-model        # once: the local model, about 115 GB, to ~/.sicode/models
 cd your-project
 sicode                         # in the terminal

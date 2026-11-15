@@ -4,6 +4,7 @@
 local model, or to Claude as architect when the task is set to "Claude plans". The page talks to this server over
 JSON and one server-sent event stream; every request needs the token from the URL the server prints.
 """
+import base64
 import difflib
 import json
 import os
@@ -19,9 +20,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__, planners, sysinfo
+from .router_ml import PROVIDER_COST, RuntimeRouterML
 from .cli import (ARCHITECT_PROMPT, ARCHITECT_TOOLS, DELEGATE, SOLO_API_PROMPT, COMPACT_REQUEST, FALLBACK_MODELS, INIT_REQUEST, INSTRUCTION_FILES,
                   MODEL_ALIASES, MODES, vram_cap, have_credentials, load_config, load_saved_key, save_config, short, valid_input)
-from .tools import SKIP_DIRS, TOOLS, Workspace, clip
+from .tools import MEDIA_EXTS, SKIP_DIRS, TOOLS, Workspace, clip, read_clipboard_media
 from .worker import DIRECT_PROMPT, WORKER_PROMPT, Engine, local_models, parse_reply, run_task
 
 TASKS_DIR = os.path.join(os.path.expanduser("~"), ".sicode", "tasks")
@@ -104,6 +106,13 @@ class Task:
         self.sessions = {}     # planner -> the session id of its command-line tool, to continue with
         self.undo = []         # (label, {path: content before}) per request that changed files
         self.changed = {}      # path -> content before the task first changed it (None: new file)
+        self.model_usage = {}  # model_label -> {"runs": int, "tokens": int, "cost": float, "cloud": bool}
+
+    def record_model(self, label, tokens=0, cost=0.0, cloud=True):
+        m = self.model_usage.setdefault(label, {"runs": 0, "tokens": 0, "cost": 0.0, "cloud": bool(cloud)})
+        m["runs"] += 1
+        m["tokens"] += int(tokens or 0)
+        m["cost"] += float(cost or 0.0)
 
     def head(self):
         return {"id": self.id, "title": self.title, "workspace": self.workspace, "created": self.created,
@@ -113,7 +122,7 @@ class Task:
         os.makedirs(TASKS_DIR, exist_ok=True)
         with open(os.path.join(TASKS_DIR, self.id + ".json"), "w", encoding="utf-8") as f:
             json.dump({**self.head(), "started": None, "items": self.items, "summary": self.summary,
-                       "sessions": self.sessions}, f)
+                       "sessions": self.sessions, "model_usage": self.model_usage}, f)
 
     @staticmethod
     def load(path):
@@ -123,6 +132,7 @@ class Task:
         t.title, t.created, t.items, t.summary = d["title"], d["created"], d["items"], d.get("summary", "")
         t.elapsed = float(d.get("elapsed") or 0.0)
         t.sessions = d.get("sessions") or {}
+        t.model_usage = d.get("model_usage") or {}
         for it in t.items:  # nothing is still running or waiting after a restart
             if it.get("status") in ("pending", "running"):
                 it["status"] = "stopped"
@@ -150,21 +160,22 @@ class Web:
         self.mode = a.mode
         self.allowed = set()
         self.lock = threading.RLock()
+        self.engine_lock = threading.Lock()
+        self._ctx = threading.local()
+        self.active = {}          # task_id -> run context dict (supports concurrent projects)
         self.subs = []            # event queues of the connected pages
         self.tasks = {}
         self.engine = None
         self.engine_task = None   # the task whose conversation the engine holds
         self.local_open = False
-        self.busy = None          # id of the task being worked on
         self.run_id = 0           # incremented on each run and on force-stop so stale threads cannot clobber state
-        self.stop = False
         self.waiting = {}         # approval item id -> [threading.Event, answer]
         self.client = self.anthropic = None
-        self.usage = {"in": 0, "out": 0, "cache_read": 0, "local": 0}
-        self.task = self.ws = None  # the task being worked on and its workspace
-        self.cmd_item = None
-        self.sub = False          # inside a delegated task
-        self.by = ""              # hybrid: who is acting now, "c" (the cloud model) or "l" (the local model)
+        self.usage = {"in": 0, "out": 0, "cache_read": 0, "local": 0, "cloud_est": 0, "cost_usd": 0.0, "tok_per_min": 0.0}
+        self._usage_t0 = time.time()
+        self.ml = RuntimeRouterML()
+        self._fallback_ctx = {"task": None, "ws": None, "stop": False, "cmd_item": None,
+                              "tool_item": None, "sub": False, "by": "", "planner_chat": None, "monitor_chat": None}
         cfg = load_config()
         self.enabled_planners = dict(cfg.get("enabled_planners") or {})
         for k in planners.PLANNERS:
@@ -174,7 +185,11 @@ class Web:
         raw_usage = cfg.get("planner_usage") or {}
         for k in planners.PLANNERS:
             u = raw_usage.get(k) or {}
-            self.planner_usage[k] = {"used": int(u.get("used", 0)), "quota_left": float(u.get("quota_left", 100.0))}
+            self.planner_usage[k] = {
+                "used": int(u.get("used", 0)),
+                "quota_left": float(u.get("quota_left", 100.0)),
+                "quota_manual": bool(u.get("quota_manual", False)),
+            }
         self.mix_auto = bool(cfg.get("mix_auto", True))
         self.project_cloud_ratio = {os.path.realpath(k): max(0, min(100, int(v)))
                                     for k, v in (cfg.get("project_cloud_ratio") or {}).items()}
@@ -185,9 +200,29 @@ class Web:
             self.planner_models["agy"] = cfg["agy_model"]
         self.planner_efforts = dict(cfg.get("planner_efforts") or {})
         self.watchdog_minutes = float(cfg.get("watchdog_minutes", 10))
-        self.planner_chat = None  # the Claude Code, Codex or Antigravity run in progress
-        self.monitor_chat = None  # cloud watchdog check in progress
         self.load_tasks()
+
+    def _run(self):
+        return getattr(self._ctx, "run", self._fallback_ctx)
+
+    @property
+    def busy(self):
+        with self.lock:
+            return next(iter(self.active), None)
+
+    def _make_prop(key):
+        return property(lambda self: self._run()[key], lambda self, v: self._run().__setitem__(key, v))
+
+    task = _make_prop("task")
+    ws = _make_prop("ws")
+    stop = _make_prop("stop")
+    cmd_item = _make_prop("cmd_item")
+    tool_item = _make_prop("tool_item")
+    sub = _make_prop("sub")
+    by = _make_prop("by")
+    planner_chat = _make_prop("planner_chat")
+    monitor_chat = _make_prop("monitor_chat")
+    del _make_prop
 
     def load_tasks(self):
         if not os.path.isdir(TASKS_DIR):
@@ -208,22 +243,83 @@ class Web:
             for q in self.subs:
                 q.put(data)
 
+    def unload_engine(self):
+        with self.lock:
+            if self.engine is not None:
+                try:
+                    self.engine.close()
+                except Exception:
+                    pass
+                self.engine = None
+                self.engine_task = None
+                self.local_open = False
+
+    def _effective_usage(self):
+        detected = planners.detect_account_usage()
+        eff = {}
+        for k in planners.PLANNERS:
+            u = dict(self.planner_usage.get(k) or {"used": 0, "quota_left": 100.0, "quota_manual": False})
+            d = detected.get(k) or {}
+            u["used_5h"] = int(d.get("used_5h", 0))
+            u["used_24h"] = int(d.get("used_24h", 0))
+            if not u.get("quota_manual"):
+                u["quota_left"] = float(d.get("est_quota_left", 100.0))
+            eff[k] = u
+        return eff
+
     def state(self):
         e = self.engine
         avail = set(planners.available_planners(have_credentials()))
-        primary = planners.pick_primary_planner(self.enabled_planners, self.planner_usage, have_credentials())
+        eff_usage = self._effective_usage()
+        avail_enabled = [k for k in avail if self.enabled_planners.get(k, False)]
+        cands = avail_enabled or [self.planner]
+        primary, primary_effort, _ = self.ml.recommend(
+            "", cands, cloud_ratio=10, usage_map=eff_usage, default_efforts=self.planner_efforts,
+        )
+        elapsed_min = max(1.0 / 60.0, (time.time() - self._usage_t0) / 60.0)
+        total_tok = self.usage["local"] + self.usage["in"] + self.usage["out"] + self.usage.get("cloud_est", 0)
+        self.usage["tok_per_min"] = round(total_tok / elapsed_min, 1)
+        with self.lock:
+            busy_tasks = list(self.active.keys())
+        project_models = {}
+        for t in self.tasks.values():
+            ws_key = os.path.realpath(t.workspace)
+            pm = project_models.setdefault(ws_key, {})
+            if t.model_usage:
+                for k, v in t.model_usage.items():
+                    cur = pm.setdefault(k, {"runs": 0, "tokens": 0, "cost": 0.0, "cloud": bool(v.get("cloud", True))})
+                    cur["runs"] += int(v.get("runs", 0))
+                    cur["tokens"] += int(v.get("tokens", 0))
+                    cur["cost"] += float(v.get("cost", 0.0))
+            else:
+                for it in t.items:
+                    if it.get("type") == "assistant" and it.get("who"):
+                        who = it["who"]
+                        cur = pm.setdefault(who, {"runs": 0, "tokens": 0, "cost": 0.0, "cloud": who != "local"})
+                        cur["runs"] += 1
+        project_models_out = {
+            ws: sorted(
+                [{"model": k, "runs": v["runs"], "tokens": v["tokens"], "cost": round(v["cost"], 4), "cloud": v["cloud"]}
+                 for k, v in m.items()],
+                key=lambda x: (-x["runs"], -x["tokens"]),
+            )
+            for ws, m in project_models.items()
+        }
         return {"version": __version__, "mode": self.mode, "modes": MODES, "model": self.a.model, "effort": self.a.effort,
-                "busy": self.busy, "key": have_credentials(), "planner": self.planner, "vram_cap": vram_cap(self.a),
+                "busy": busy_tasks[0] if busy_tasks else None, "busy_tasks": busy_tasks,
+                "key": have_credentials(), "planner": self.planner, "vram_cap": vram_cap(self.a),
                 "watchdog_minutes": self.watchdog_minutes,
-                "mix_auto": self.mix_auto, "primary_planner": primary,
+                "mix_auto": self.mix_auto, "primary_planner": primary, "primary_effort": primary_effort,
                 "project_cloud_ratio": self.project_cloud_ratio,
-                "enabled_planners": self.enabled_planners, "planner_usage": self.planner_usage,
+                "project_models": project_models_out,
+                "enabled_planners": self.enabled_planners, "planner_usage": eff_usage,
+                "ml_summary": self.ml.summary()[:6],
                 "local_model": self.a.worker_model, "local_models": local_models(),
                 "planner_models": self.planner_models, "planner_efforts": self.planner_efforts,
                 "agy_models": planners.agy_base_models(),
                 "planners": [{"id": k, "label": v, "found": k == "api" or (k in avail),
                               "installed": k in avail, "enabled": bool(self.enabled_planners.get(k, False)),
-                              "usage": self.planner_usage.get(k, {"used": 0, "quota_left": 100.0})}
+                              "usage": eff_usage.get(k, {"used": 0, "used_5h": 0, "used_24h": 0, "quota_left": 100.0})}
                              for k, v in planners.PLANNERS.items()], "default_workspace": os.path.realpath(self.a.dir),
                 "engine": bool(e), "ctx": e.ctx if e else 0,
                 "ctx_used": e.ctx_used if e and self.local_open else 0, "ctx_task": self.engine_task,
@@ -380,62 +476,63 @@ class Web:
 
     def run_local(self, text, prompt, fresh, seed_stream=True):
         """One request on the local model, streamed into the task. Returns (answer, stats)."""
-        engine = self.start_engine()
-        cur = {"think": None, "answer": None}
+        with self.engine_lock:
+            engine = self.start_engine()
+            cur = {"think": None, "answer": None}
 
-        def think(t):
-            if cur["think"] is None:
-                cur["think"] = self.add(type="think", text="", status="running")
-            self.append(cur["think"], t)
+            def think(t):
+                if cur["think"] is None:
+                    cur["think"] = self.add(type="think", text="", status="running")
+                self.append(cur["think"], t)
 
-        def answer(t):
-            if cur["think"] is not None and cur["think"].get("status") == "running":
-                self.update(cur["think"], status="done")
-            if cur["answer"] is None:
-                cur["answer"] = self.add(type="assistant", who="local", text="")
-            self.append(cur["answer"], t)
-
-        split = [Splitter(think, answer)]
-
-        def on_event(kind, data):
-            if self.stop:
-                raise KeyboardInterrupt
-            if kind == "delta":
-                split[0].feed(data)
-            elif kind == "reply":
-                if split[0].finish() and cur["think"] is not None:  # no </think>: it was the answer all along
-                    self.update(cur["think"], type="assistant", who="local", status="done")
-                elif cur["think"] is not None:
+            def answer(t):
+                if cur["think"] is not None and cur["think"].get("status") == "running":
                     self.update(cur["think"], status="done")
-                cur["think"] = cur["answer"] = None
-                split[0] = Splitter(think, answer)
-            elif kind == "call":
-                self.on_call(*data)
-            elif kind == "result":
-                self.on_result(data)
-            elif kind == "stats":
-                self.usage["local"] += data["gen_tokens"]
-                self.push_state()
+                if cur["answer"] is None:
+                    cur["answer"] = self.add(type="assistant", who="local", text="")
+                self.append(cur["answer"], t)
 
-        def _run_watchdog():
-            done_ev = threading.Event()
-            if self.watchdog_minutes > 0:
-                threading.Thread(
-                    target=self._local_watchdog,
-                    args=(self.task, text, self.run_id, done_ev),
-                    daemon=True,
-                ).start()
-            return done_ev
+            split = [Splitter(think, answer)]
 
-        wd_done = _run_watchdog()
-        try:
-            return run_task(engine, self.ws, text, on_event, effort=self.a.worker_effort, fresh=fresh, prompt=prompt,
-                            instructions=self.instructions()[1], stream=True)
-        finally:
-            wd_done.set()
-            for it in cur.values():
-                if it is not None and it.get("status") == "running":
-                    self.update(it, status="done")
+            def on_event(kind, data):
+                if self.stop:
+                    raise KeyboardInterrupt
+                if kind == "delta":
+                    split[0].feed(data)
+                elif kind == "reply":
+                    if split[0].finish() and cur["think"] is not None:  # no </think>: it was the answer all along
+                        self.update(cur["think"], type="assistant", who="local", status="done")
+                    elif cur["think"] is not None:
+                        self.update(cur["think"], status="done")
+                    cur["think"] = cur["answer"] = None
+                    split[0] = Splitter(think, answer)
+                elif kind == "call":
+                    self.on_call(*data)
+                elif kind == "result":
+                    self.on_result(data)
+                elif kind == "stats":
+                    self.usage["local"] += data["gen_tokens"]
+                    self.push_state()
+
+            def _run_watchdog():
+                done_ev = threading.Event()
+                if self.watchdog_minutes > 0:
+                    threading.Thread(
+                        target=self._local_watchdog,
+                        args=(self.task, text, self.run_id, done_ev),
+                        daemon=True,
+                    ).start()
+                return done_ev
+
+            wd_done = _run_watchdog()
+            try:
+                return run_task(engine, self.ws, text, on_event, effort=self.a.worker_effort, fresh=fresh, prompt=prompt,
+                                instructions=self.instructions()[1], stream=True)
+            finally:
+                wd_done.set()
+                for it in cur.values():
+                    if it is not None and it.get("status") == "running":
+                        self.update(it, status="done")
 
     def _cloud_check(self, prompt, should_stop):
         if self.planner == "api":
@@ -540,11 +637,12 @@ class Web:
 
     def compact(self):
         t = self.task
-        if not (self.local_open and self.engine_task == t.id):
-            self.add(type="note", text="Nothing to compact: this task has no open local conversation.")
-            return
-        note = self.add(type="note", text="Summarising the conversation ...", status="running")
-        reply = self.engine.turn(COMPACT_REQUEST)
+        with self.engine_lock:
+            if not (self.local_open and self.engine_task == t.id and self.engine is not None):
+                self.add(type="note", text="Nothing to compact: this task has no open local conversation.")
+                return
+            note = self.add(type="note", text="Summarising the conversation ...", status="running")
+            reply = self.engine.turn(COMPACT_REQUEST)
         t.summary = parse_reply(reply["text"])[1]
         self.local_open = False
         self.update(note, status="done", text=f"Compacted: {reply['ctx_used']:,} tokens of context replaced by a "
@@ -582,7 +680,7 @@ class Web:
             self.on_result(result)
         return {"type": "tool_result", "tool_use_id": block.id, "content": result}
 
-    def claude_turn(self, text, solo=False):
+    def claude_turn(self, text, solo=False, media_items=None):
         t = self.task
         if self.client is None:
             if not have_credentials():
@@ -593,7 +691,20 @@ class Web:
             self.anthropic, self.client = anthropic, anthropic.Anthropic()
         an = self.anthropic
         mark = len(t.messages)
-        t.messages.append({"role": "user", "content": text})
+        imgs = [m for m in (media_items or []) if str(m.get("mime", "")).startswith("image/")]
+        if imgs:
+            blocks = []
+            for m in imgs:
+                try:
+                    with open(m["path"], "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("ascii")
+                    blocks.append({"type": "image", "source": {"type": "base64", "media_type": m["mime"], "data": b64}})
+                except OSError:
+                    continue
+            blocks.append({"type": "text", "text": text})
+            t.messages.append({"role": "user", "content": blocks})
+        else:
+            t.messages.append({"role": "user", "content": text})
         name, notes = self.instructions()
         system = (SOLO_API_PROMPT if solo else ARCHITECT_PROMPT) + \
             (f"\n\n# Project instructions ({name})\n\n{notes}" if notes else "")
@@ -659,20 +770,28 @@ class Web:
             pass
         self.push_state()
 
-    def _active_planner(self, route):
-        if route == "hybrid" and self.mix_auto:
-            return planners.pick_primary_planner(self.enabled_planners, self.planner_usage, have_credentials())
-        return self.planner
+    def _active_planner(self, route, text="", media=None, cloud_ratio=10):
+        avail = [k for k in planners.available_planners(have_credentials()) if self.enabled_planners.get(k, False)]
+        if route in ("hybrid", "cloud") and self.mix_auto:
+            cands = avail or [self.planner]
+            best_p, best_ef, _ = self.ml.recommend(
+                text, cands, media=media, cloud_ratio=cloud_ratio,
+                usage_map=self._effective_usage(), default_efforts=self.planner_efforts,
+            )
+            return best_p, best_ef
+        ef = self.planner_efforts.get(self.planner) or ("high" if self.planner == "api" else "medium")
+        return self.planner, ef
 
     def _providers_summary(self, primary):
         avail = set(planners.available_planners(have_credentials()))
+        eff_usage = self._effective_usage()
         lines = []
         for k, label in planners.PLANNERS.items():
             if k == primary or k not in avail or not self.enabled_planners.get(k, False):
                 continue
             m = self.planner_models.get(k) or (self.a.model if k == "api" else "default")
             ef = self.planner_efforts.get(k) or (self.a.effort if k == "api" else "default")
-            q = self.planner_usage.get(k, {}).get("quota_left", 100.0)
+            q = eff_usage.get(k, {}).get("quota_left", 100.0)
             lines.append(f'- "{k}" ({label}): model={m}, effort={ef}, usage_left={q:.0f}%')
         return "\n".join(lines)
 
@@ -708,6 +827,8 @@ class Web:
                 finally:
                     self.planner_chat = None
             self._record_planner_usage(prov)
+            if self.task:
+                self.task.record_model(f"{prov}: {model or 'default'}" + (f" ({effort})" if effort else ""), cloud=True)
             for path, old, new in self.ws.changes_since(snap):
                 lines, added, removed, more = diff_lines(old, new if new is not None else "")
                 self.add(type="diff", path=path, new_file=old is None, deleted=new is None, added=added,
@@ -722,22 +843,23 @@ class Web:
         finally:
             self.sub = False
 
-    def login_turn(self, text, solo=False, planner_id=None):
+    def login_turn(self, text, solo=False, planner_id=None, media_items=None, effort=None):
         """Cloud CLI planner: hybrid (Mix) or working alone (cloud)."""
         p = planner_id or self.planner
         t = self.task
         label = planners.PLANNERS[p]
         key = p + (":solo" if solo else "")
-        p_info = "" if solo else self._providers_summary(p)
-        c_ratio = self.project_cloud_ratio.get(os.path.realpath(t.workspace), 50)
+        p_info = self._providers_summary(p)
+        c_ratio = self.project_cloud_ratio.get(os.path.realpath(t.workspace), 10)
+        imgs = [m["path"] for m in (media_items or []) if str(m.get("mime", "")).startswith("image/")]
         chat = planners.Planner(p, t.workspace,
                                 model=self.planner_models.get(p) or None,
-                                effort=self.planner_efforts.get(p) or None,
+                                effort=effort or self.planner_efforts.get(p) or None,
                                 session=t.sessions.get(key), solo=solo, allow_shell=self.mode == "auto",
-                                providers_info=p_info, cloud_ratio=c_ratio)
+                                providers_info=p_info, cloud_ratio=c_ratio, images=imgs)
         self.planner_chat = chat
         who = {"claude-code": "claude", "codex": "codex", "agy": "agy", "gemini": "gemini",
-               "opencode": "opencode", "codebuddy": "codebuddy", "tcloud": "tcloud"}.get(p, p)
+               "codebuddy": "codebuddy", "tcloud": "tcloud"}.get(p, p)
         note = [None]
         snap = [None]
 
@@ -772,7 +894,48 @@ class Web:
 
     # --- one request ---
 
-    def attach(self, text):
+    _MEDIA_EXTS = set(MEDIA_EXTS)
+
+    def _save_media(self, task, media_list):
+        import re
+        import shutil
+        saved = []
+        if not media_list:
+            return saved
+        up_dir = os.path.join(task.workspace, ".sicode", "uploads")
+        os.makedirs(up_dir, exist_ok=True)
+        ts = int(time.time() * 1000)
+        for i, m in enumerate(media_list):
+            if not isinstance(m, dict):
+                continue
+            name = re.sub(r"[^A-Za-z0-9._-]", "_", str(m.get("name") or f"media_{i}"))
+            mime = str(m.get("mime") or "application/octet-stream")
+            abs_p = os.path.join(up_dir, f"{ts}_{i}_{name}")
+            src_path = m.get("path")
+            if src_path and os.path.isfile(src_path):
+                try:
+                    if os.path.normcase(os.path.dirname(os.path.realpath(src_path))) == os.path.normcase(os.path.realpath(up_dir)):
+                        abs_p = src_path
+                    else:
+                        shutil.copy2(src_path, abs_p)
+                    saved.append({"name": name, "mime": mime, "path": abs_p, "rel": os.path.relpath(abs_p, task.workspace)})
+                    continue
+                except OSError:
+                    continue
+            raw_b64 = str(m.get("data_b64") or "")
+            if "," in raw_b64 and raw_b64.startswith("data:"):
+                raw_b64 = raw_b64.split(",", 1)[1]
+            if not raw_b64:
+                continue
+            try:
+                with open(abs_p, "wb") as f:
+                    f.write(base64.b64decode(raw_b64))
+                saved.append({"name": name, "mime": mime, "path": abs_p, "rel": os.path.relpath(abs_p, task.workspace)})
+            except (OSError, ValueError):
+                continue
+        return saved
+
+    def attach(self, text, media_items=None):
         import re
         out = text
         for ref in dict.fromkeys(re.findall(r"(?<!\S)@([^\s@]+)", text)):
@@ -781,47 +944,97 @@ class Web:
             except ValueError:
                 continue
             if os.path.isfile(p):
-                with open(p, encoding="utf-8", errors="replace") as f:
-                    out += f"\n\n<file path=\"{self.ws.rel(p)}\">\n{clip(f.read())}\n</file>"
+                if os.path.splitext(p)[1].lower() in self._MEDIA_EXTS:
+                    out += f"\n\n<attached_media path=\"{self.ws.rel(p)}\" />"
+                else:
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        out += f"\n\n<file path=\"{self.ws.rel(p)}\">\n{clip(f.read())}\n</file>"
+        for m in (media_items or []):
+            out += f"\n\n<attached_media path=\"{m['rel']}\" mime=\"{m['mime']}\" />"
         return out
 
-    def work(self, task, text, route, run_id=None):
+    def work(self, task, text, route, run_id=None, media=None, run_ctx=None):
+        self._ctx.run = run_ctx or {
+            "task": task, "ws": None, "stop": False, "run_id": run_id,
+            "cmd_item": None, "tool_item": None, "sub": False, "by": "",
+            "planner_chat": None, "monitor_chat": None,
+        }
         self.task, self.stop, self.sub, self.cmd_item = task, False, False, None
         task.started = time.time()
-        self.by = "c" if route == "hybrid" else ""  # hybrid: every step is marked with who did it
-        self.ws = Workspace(task.workspace, self.approve_command, self.approve_edit, self.show_plan,
-                            should_stop=lambda: self.stop or (run_id is not None and self.run_id != run_id))
+        self.ws = Workspace(
+            task.workspace, self.approve_command, self.approve_edit, self.show_plan,
+            should_stop=lambda: self.stop or (run_id is not None and self.active.get(task.id, {}).get("run_id") != run_id),
+        )
         self.ws.begin_turn()
+        t0 = time.monotonic()
+        tokens_before = self.usage["local"] + self.usage["in"] + self.usage["out"] + self.usage["cloud_est"]
+        c_ratio = self.project_cloud_ratio.get(os.path.realpath(task.workspace), 10)
+        used_p, used_ef, ok = "local", self.a.worker_effort, False
+        prompt_text = text
         try:
             prior = task.transcript()
+            media_items = self._save_media(task, media)
+            if media_items and route == "local":
+                route = "hybrid"
+                self.add(type="note", text="Media attached: routing to multimodal Cloud AI (local model is text-only).")
+            self.by = "c" if route == "hybrid" else ""  # hybrid: every step is marked with who did it
+            ui_media = [{"name": m["name"], "mime": m["mime"], "rel": m["rel"]} for m in media_items]
             if text == "/compact":
                 self.compact()
+                ok = True
                 return
             if text == "/init":
                 text = INIT_REQUEST
                 self.add(type="user", text="Write the project notes (SICODE.md)", route=route)
             else:
-                self.add(type="user", text=text, route=route)
+                self.add(type="user", text=text, route=route, **({"media": ui_media} if ui_media else {}))
             if task.title == "New task":
                 task.title = text.strip().splitlines()[0][:70]
             self.push_state()
-            active_p = self._active_planner(route)
-            if route in ("hybrid", "cloud") and active_p != "api":
-                self.login_turn(self.attach(text), solo=route == "cloud", planner_id=active_p)
-            elif route in ("hybrid", "cloud"):
-                self._record_planner_usage("api")
-                self.claude_turn(self.attach(text), solo=route == "cloud")
+            if route == "cloud" and self.engine is not None and len(self.active) <= 1:
+                self.unload_engine()
+                self.add(type="note", text="Cloud 100%: unloaded local model to free RAM and VRAM.")
+                self.push_state()
+            prompt_text = self.attach(text, media_items=media_items)
+            if route in ("hybrid", "cloud"):
+                active_p, active_ef = self._active_planner(route, text, media=media_items, cloud_ratio=c_ratio)
+                used_p, used_ef = active_p, active_ef
+                if active_p != "api":
+                    self.login_turn(prompt_text, solo=route == "cloud", planner_id=active_p,
+                                    media_items=media_items, effort=active_ef)
+                else:
+                    self._record_planner_usage("api")
+                    self.claude_turn(prompt_text, solo=route == "cloud", media_items=media_items)
             else:
-                self.local_turn(self.attach(text), prior)
+                self.local_turn(prompt_text, prior)
+            ok = True
         except KeyboardInterrupt:
-            if run_id is None or self.run_id == run_id:
+            if run_id is None or self.active.get(task.id, {}).get("run_id") == run_id:
                 self.add(type="note", text="Stopped.")
         except Exception as e:  # shown in the task instead of killing the worker thread
-            if run_id is None or self.run_id == run_id:
+            if run_id is None or self.active.get(task.id, {}).get("run_id") == run_id:
                 self.add(type="error", text=str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}")
         finally:
+            if route in ("hybrid", "cloud") and used_p != "api":
+                reply_chars = sum(len(str(it.get("text", ""))) for it in task.items[-4:] if it.get("type") == "assistant")
+                self.usage["cloud_est"] += max(200, (len(prompt_text) + reply_chars) // 4)
+            tokens_after = self.usage["local"] + self.usage["in"] + self.usage["out"] + self.usage["cloud_est"]
+            delta_tok = max(0, tokens_after - tokens_before)
+            cost, _ = self.ml.observe(
+                used_p, used_ef, text, media if media else None, c_ratio, ok,
+                max(0.1, time.monotonic() - t0), delta_tok,
+            )
+            self.usage["cost_usd"] += cost
+            if used_p == "local":
+                lm_name = next((m["label"] for m in local_models() if os.path.normcase(m["path"]) ==
+                                os.path.normcase(self.a.worker_model)), os.path.basename(self.a.worker_model))
+                m_label = f"local: {lm_name}"
+            else:
+                m_id = self.a.model if used_p == "api" else (self.planner_models.get(used_p) or "default")
+                m_label = f"{used_p}: {m_id}" + (f" ({used_ef})" if used_ef else "")
+            task.record_model(m_label, tokens=delta_tok, cost=cost, cloud=(used_p != "local"))
             with self.lock:
-                if run_id is not None and self.run_id != run_id:
+                if run_id is not None and self.active.get(task.id, {}).get("run_id") != run_id:
                     return
                 if task.started is not None:
                     task.elapsed += max(0.0, time.time() - task.started)
@@ -835,67 +1048,85 @@ class Web:
                     task.save()
                 except OSError:
                     pass
-                self.busy = None
+                if self.active.get(task.id) is self._ctx.run:
+                    self.active.pop(task.id, None)
             self.push_state()
 
-    def _start_work(self, task, text, route):
+    def _start_work(self, task, text, route, media=None):
         with self.lock:
-            if self.busy:
+            if task.id in self.active:
                 return False
-            self.busy = task.id
             self.run_id += 1
             rid = self.run_id
+            run_ctx = {
+                "task": task, "ws": None, "stop": False, "run_id": rid,
+                "cmd_item": None, "tool_item": None, "sub": False, "by": "",
+                "planner_chat": None, "monitor_chat": None,
+            }
+            self.active[task.id] = run_ctx
             task.started = time.time()
         self.push_state()
         route = {"claude": "hybrid", "mix": "hybrid"}.get(route, route)  # "claude": pages before 0.2.1
         route = route if route in ("hybrid", "cloud") else "local"
-        threading.Thread(target=self.work, args=(task, text, route, rid), daemon=True).start()
+        threading.Thread(target=self.work, args=(task, text, route, rid, media, run_ctx), daemon=True).start()
         return True
 
-    def force_stop(self):
+    def force_stop(self, task_id=None):
         with self.lock:
-            self.stop = True
             self.run_id += 1
+            targets = [task_id] if (task_id and task_id in self.active) else list(self.active.keys())
+            if not targets:
+                for ev in list(self.waiting.values()):
+                    ev[1] = "no"
+                    ev[0].set()
+            for tid in targets:
+                ctx = self.active.get(tid)
+                if not ctx:
+                    continue
+                ctx["stop"] = True
+                if ctx.get("ws"):
+                    try:
+                        ctx["ws"].kill_command()
+                    except Exception:
+                        pass
+                if ctx.get("planner_chat"):
+                    try:
+                        ctx["planner_chat"].stop()
+                    except Exception:
+                        pass
+                if ctx.get("monitor_chat"):
+                    try:
+                        ctx["monitor_chat"].stop()
+                    except Exception:
+                        pass
             for ev in list(self.waiting.values()):
                 ev[1] = "no"
                 ev[0].set()
-            if self.ws:
-                try:
-                    self.ws.kill_command()
-                except Exception:
-                    pass
-            if self.planner_chat:
-                try:
-                    self.planner_chat.stop()
-                except Exception:
-                    pass
-            if self.monitor_chat:
-                try:
-                    self.monitor_chat.stop()
-                except Exception:
-                    pass
-            if self.engine:
+            if self.engine and (task_id is None or self.engine_task == task_id):
                 try:
                     self.engine.close()
                 except Exception:
                     pass
                 self.engine = None
                 self.engine_task = None
-            t = self.tasks.get(self.busy) if self.busy else None
-            if t:
-                self.task = t
-                if t.started is not None:
-                    t.elapsed += max(0.0, time.time() - t.started)
-                    t.started = None
-                for it in t.items:
-                    if it.get("status") in ("pending", "running"):
-                        self.update(it, status="stopped")
-                self.add(type="note", text="Force stopped.")
-                try:
-                    t.save()
-                except OSError:
-                    pass
-            self.busy = None
+            for tid in targets:
+                t = self.tasks.get(tid)
+                if t:
+                    if t.started is not None:
+                        t.elapsed += max(0.0, time.time() - t.started)
+                        t.started = None
+                    for it in t.items:
+                        if it.get("status") in ("pending", "running"):
+                            it["status"] = "stopped"
+                    it_note = {"id": uuid.uuid4().hex[:8], "type": "note", "text": "Force stopped."}
+                    t.items.append(it_note)
+                    t.rev += 1
+                    self.send({"op": "item", "task": t.id, "item": it_note})
+                    try:
+                        t.save()
+                    except OSError:
+                        pass
+                self.active.pop(tid, None)
         self.push_state()
 
     # --- what the page asks for ---
@@ -919,23 +1150,40 @@ class Web:
         if path == "/api/send":
             t = self.tasks.get(body.get("task", ""))
             text = (body.get("text") or "").strip()
-            if not t or not text:
+            media = body.get("media") or []
+            if not t or (not text and not media):
                 return {"error": "nothing to send"}
-            if not self._start_work(t, text, body.get("route")):
+            if not text and media:
+                text = "Please inspect the attached media."
+            if not self._start_work(t, text, body.get("route"), media=media):
                 return {"error": "another request is still running"}
             return {"ok": True}
+        if path == "/api/clipboard-media":
+            t = self.tasks.get(body.get("task", ""))
+            ws = t.workspace if t else self.a.dir
+            items = read_clipboard_media(os.path.join(ws, ".sicode", "uploads"))
+            out = []
+            for it in items:
+                item = {"name": it["name"], "mime": it["mime"], "path": it["path"]}
+                if it["mime"].startswith("image/") and os.path.getsize(it["path"]) <= 8_000_000:
+                    with open(it["path"], "rb") as f:
+                        item["data_b64"] = f"data:{it['mime']};base64," + base64.b64encode(f.read()).decode("ascii")
+                out.append(item)
+            return {"items": out}
         if path == "/api/stop":
-            if self.busy:
-                self.stop = True
-                if self.ws:
-                    self.ws.kill_command()
-                if self.engine:
+            tid = body.get("task") or self.busy
+            ctx = self.active.get(tid) if tid else None
+            if ctx:
+                ctx["stop"] = True
+                if ctx.get("ws"):
+                    ctx["ws"].kill_command()
+                if self.engine and self.engine_task == tid:
                     self.engine.interrupt()
-                if self.planner_chat:
-                    self.planner_chat.stop()
-            return {"ok": bool(self.busy)}
+                if ctx.get("planner_chat"):
+                    ctx["planner_chat"].stop()
+            return {"ok": bool(ctx)}
         if path == "/api/force-stop":
-            self.force_stop()
+            self.force_stop(body.get("task"))
             return {"ok": True}
         if path == "/api/restart":
             t = self.tasks.get(body.get("task", "")) or (self.tasks.get(self.busy) if self.busy else None)
@@ -946,8 +1194,8 @@ class Web:
             if not text:
                 return {"error": "nothing to restart"}
             route = body.get("route") or (last_user.get("route") if last_user else "local")
-            if self.busy:
-                self.force_stop()
+            if t.id in self.active:
+                self.force_stop(t.id)
             self._start_work(t, text, route)
             return {"ok": True}
         if path == "/api/approve":
@@ -979,11 +1227,15 @@ class Web:
                     if k in planners.PLANNERS:
                         self.enabled_planners[k] = bool(v)
             if "quota" in body and isinstance(body["quota"], dict):
+                eff_now = self._effective_usage()
                 for k, v in body["quota"].items():
                     if k in planners.PLANNERS:
                         try:
                             q = max(0.0, min(100.0, float(v)))
-                            self.planner_usage.setdefault(k, {"used": 0, "quota_left": 100.0})["quota_left"] = q
+                            entry = self.planner_usage.setdefault(k, {"used": 0, "quota_left": 100.0, "quota_manual": False})
+                            if abs(q - float(eff_now.get(k, {}).get("quota_left", 100.0))) > 0.01:
+                                entry["quota_left"] = q
+                                entry["quota_manual"] = True
                         except (TypeError, ValueError):
                             pass
             if "mix_auto" in body:
@@ -999,10 +1251,12 @@ class Web:
         if path == "/api/project-mix":
             ws = os.path.realpath(body.get("workspace") or self.a.dir)
             try:
-                ratio = max(0, min(100, int(body.get("ratio", 50))))
+                ratio = max(0, min(100, int(body.get("ratio", 10))))
             except (TypeError, ValueError):
                 return {"error": "invalid ratio"}
             self.project_cloud_ratio[ws] = ratio
+            if ratio >= 100 and not self.busy and self.engine is not None:
+                self.unload_engine()
             try:
                 save_config(project_cloud_ratio=self.project_cloud_ratio)
             except OSError:

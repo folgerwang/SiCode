@@ -23,7 +23,6 @@ PLANNERS = {
     "codex": "ChatGPT account (through Codex)",
     "agy": "Google account (through Antigravity)",
     "gemini": "Google account (through Gemini CLI)",
-    "opencode": "OpenCode CLI",
     "codebuddy": "Tencent CodeBuddy CLI",
     "tcloud": "Tencent Cloud AI CLI",
 }
@@ -33,7 +32,6 @@ PLANNER_BINS = {
     "codex": "codex",
     "agy": "agy",
     "gemini": "gemini",
-    "opencode": "opencode",
     "codebuddy": "codebuddy",
     "tcloud": "tcloud",
 }
@@ -57,7 +55,7 @@ PLAN_FORMAT = """one step per line, each starting with its state and who does it
 States: [ ] to do, [~] in progress, [x] done."""
 
 
-def hybrid_prompt(can_run, providers_info="", cloud_ratio=50):
+def hybrid_prompt(can_run, providers_info="", cloud_ratio=10):
     """The system prompt for the primary cloud planner in the hybrid (Mix) mode."""
     run = ("You can also run shell commands yourself." if can_run else
            "You cannot run shell commands yourself: builds, tests and other commands are always [l] steps.")
@@ -122,6 +120,21 @@ directory). Carry out the request yourself: read the relevant files before chang
 request asks for and no others, and check your work when you have a way to. If you cannot run commands here, say \
 which checks are still to be run. Keep the final reply short: what you did or found, what you ran and its result, \
 and anything unfinished."""
+
+
+def cloud_orchestrate_prompt(can_run, providers_info):
+    """System prompt for 100% Cloud mode when multiple cloud providers/models are activated."""
+    run = "You may also run shell commands yourself." if can_run else "Avoid running destructive shell commands."
+    return f"""{SOLO_PROMPT} {run}
+
+Other activated cloud providers (ranked by usage left) are also available for specialized sub-tasks:
+{providers_info}
+
+If a sub-task benefits from another provider, model, or thinking effort (low, medium, high, xhigh), you may end a reply with one block:
+<delegate provider="codex" effort="high">
+The complete brief for that provider.
+</delegate>
+SiCode will run that step on the chosen provider and send you its report. A reply without <delegate> finishes your turn."""
 
 DELEGATE_RE = re.compile(r"<delegate([^>]*)>\s*(.*?)\s*</delegate>", re.S)
 ATTR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
@@ -197,25 +210,110 @@ def available_planners(have_key):
     return [k for k in PLANNERS if (k == "api" and have_key) or bool(find(k))]
 
 
+def _count_jsonl_timestamps(path, field, scale, now):
+    c5 = c24 = 0
+    if not os.path.isfile(path):
+        return 0, 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    ts = float(json.loads(line).get(field, 0)) / scale
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if ts >= now - 18000:
+                    c5 += 1
+                if ts >= now - 86400:
+                    c24 += 1
+    except OSError:
+        pass
+    return c5, c24
+
+
+def _count_recent_dirs(root, now):
+    c5 = c24 = 0
+    if not os.path.isdir(root):
+        return 0, 0
+    try:
+        for entry in os.scandir(root):
+            try:
+                mt = entry.stat().st_mtime
+                if mt >= now - 18000:
+                    c5 += 1
+                if mt >= now - 86400:
+                    c24 += 1
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return c5, c24
+
+
+def detect_account_usage():
+    """Inspect local CLI history/session files to estimate recent usage per provider."""
+    now = time.time()
+    home = os.path.expanduser("~")
+    counts = {
+        "claude-code": _count_jsonl_timestamps(os.path.join(home, ".claude", "history.jsonl"), "timestamp", 1000.0, now),
+        "codex": _count_jsonl_timestamps(os.path.join(home, ".codex", "history.jsonl"), "ts", 1.0, now),
+        "agy": _count_recent_dirs(os.path.join(home, ".gemini", "antigravity-cli", "brain"), now),
+        "gemini": _count_recent_dirs(os.path.join(home, ".gemini", "tmp"), now),
+        "codebuddy": _count_recent_dirs(os.path.join(home, ".codebuddy"), now),
+        "tcloud": _count_recent_dirs(os.path.join(home, ".tcloud"), now),
+    }
+    out = {}
+    for k in PLANNERS:
+        u5, u24 = counts.get(k, (0, 0))
+        est_left = max(5.0, round(100.0 - min(95.0, u5 * 2.5), 1)) if u5 > 0 else 100.0
+        out[k] = {"used_5h": u5, "used_24h": u24, "est_quota_left": est_left}
+    return out
+
+
 def pick_primary_planner(enabled_map, usage_map, have_key):
     """Pick the enabled, installed planner with the most usage left (highest quota_left, fewest used calls)."""
+    return pick_task_planner("", enabled_map, usage_map, have_key)
+
+
+def pick_task_planner(task_text, enabled_map, usage_map, have_key, media=None):
+    """Pick the best enabled, installed cloud provider considering remaining usage, task type, and media."""
     avail = [k for k in available_planners(have_key) if enabled_map.get(k, True)]
     if not avail:
         avail = available_planners(have_key)
     if not avail:
         return "claude-code"
+    low = (task_text or "").lower()
+    is_code = any(w in low for w in ("fix", "bug", "test", "refactor", "implement", "build", "compile", "error", "api", "function"))
+    is_design = any(w in low for w in ("ui", "design", "css", "html", "docs", "readme", "explain", "review", "search", "plan", "architecture"))
+    has_video = any(str(m.get("mime", "")).startswith("video/") for m in (media or []))
+    has_image = any(str(m.get("mime", "")).startswith("image/") for m in (media or []))
     order = list(PLANNERS.keys())
+
     def score(k):
         u = (usage_map or {}).get(k) or {}
         quota = float(u.get("quota_left", 100.0))
         used = int(u.get("used", 0))
-        return (-quota, used, order.index(k))
+        affinity = 0.0
+        if has_video:
+            if k in ("gemini", "agy"):
+                affinity += 25.0
+            elif k in ("claude-code", "api", "codex"):
+                affinity += 5.0
+        elif has_image:
+            if k in ("agy", "gemini", "claude-code", "codex", "api"):
+                affinity += 10.0
+        if is_code and k in ("codex", "claude-code", "codebuddy"):
+            affinity += 5.0
+        elif is_design and k in ("agy", "gemini", "claude-code"):
+            affinity += 5.0
+        # Usage left dominates; affinity breaks ties and steers media to capable models.
+        return (-(quota + affinity), used, order.index(k))
+
     return min(avail, key=score)
 
 
 def default_planner(have_key):
     """An account login when its tool is installed, else the API key."""
-    for p in ("claude-code", "codex", "agy", "gemini", "opencode", "codebuddy", "tcloud"):
+    for p in ("claude-code", "codex", "agy", "gemini", "codebuddy", "tcloud"):
         if find(p):
             return p
     return "api" if have_key else "claude-code"
@@ -256,13 +354,14 @@ class Planner:
     """One conversation with a cloud CLI tool, run non-interactively in the workspace."""
 
     def __init__(self, planner, cwd, model=None, effort=None, session=None, solo=False, allow_shell=False, raw=False,
-                 providers_info="", cloud_ratio=50):
+                 providers_info="", cloud_ratio=10, images=None):
         self.planner, self.cwd, self.model, self.effort = planner, cwd, model, effort
         self.solo = solo                # the tool does the work itself instead of handing it to the local model
         self.allow_shell = allow_shell  # solo: it may also run shell commands
         self.raw = raw                  # single-turn non-coding prompt (e.g. watchdog check)
         self.providers_info = providers_info
         self.cloud_ratio = cloud_ratio
+        self.images = list(images or [])
         self.session = session   # the tool's own session id, to continue the conversation
         self.proc = None
 
@@ -307,6 +406,12 @@ class Planner:
         err = b"".join(errs).decode("utf-8", errors="replace")
         return self.proc.returncode, text, err
 
+    def _system_prompt(self, can_run=None):
+        run = self.allow_shell if can_run is None else can_run
+        if self.solo:
+            return cloud_orchestrate_prompt(run, self.providers_info) if self.providers_info else SOLO_PROMPT
+        return hybrid_prompt(run, self.providers_info, self.cloud_ratio)
+
     def ask(self, prompt, should_stop=lambda: False):
         """Sends one message and returns the planner's reply text."""
         if self.planner == "claude-code":
@@ -315,7 +420,7 @@ class Planner:
             else:
                 tools = "Read,Grep,Glob,Edit,Write" + (",Bash" if self.allow_shell else "")
                 args = ["-p", "--output-format", "json", "--tools", tools, "--permission-mode", "acceptEdits",
-                        "--append-system-prompt", SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)]
+                        "--append-system-prompt", self._system_prompt(self.allow_shell)]
                 if self.allow_shell:
                     args += ["--allowedTools", "Bash"]
             if self.session:
@@ -345,13 +450,15 @@ class Planner:
             else:
                 args = ["exec", "--json", "--skip-git-repo-check", "-"]
                 if not self.raw:
-                    prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(True, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
+                    prompt = self._system_prompt(True) + "\n\n# The user's request\n\n" + prompt
             # Codex edits and runs commands inside its own sandbox, limited to the workspace
             args += ["-c", 'sandbox_mode="workspace-write"']
             if self.model:
                 args += ["-m", self.model]
             if self.effort:
                 args += ["-c", f'model_reasoning_effort="{self.effort}"']
+            for img in self.images:
+                args += ["-i", img]
             code, text, err = self._run(args, prompt, should_stop)
             reply, failure = [], ""
             for line in text.splitlines():
@@ -371,7 +478,7 @@ class Planner:
             return reply[-1]
         if self.planner == "agy":
             if not self.session and not self.raw:
-                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
+                prompt = self._system_prompt(self.allow_shell) + "\n\n# The user's request\n\n" + prompt
             args = ["--output-format", "json", "--mode", "accept-edits"]
             if self.allow_shell:
                 args.append("--dangerously-skip-permissions")
@@ -399,7 +506,7 @@ class Planner:
             return str(data.get("response") or "")
         if self.planner == "gemini":
             if not self.session and not self.raw:
-                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
+                prompt = self._system_prompt(self.allow_shell) + "\n\n# The user's request\n\n" + prompt
             args = ["-p", prompt, "-o", "json", "--approval-mode", "yolo" if self.allow_shell else "auto_edit"]
             if self.session:
                 args += ["--resume", self.session]
@@ -422,37 +529,9 @@ class Planner:
             if text.strip():
                 return text.strip()
             raise RuntimeError("Gemini CLI gave no reply" + (": " + err.strip()[-400:] if err.strip() else f" (exit code {code})"))
-        if self.planner == "opencode":
-            if not self.session and not self.raw:
-                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
-            args = ["run", "--format", "json"]
-            if self.session:
-                args += ["-s", self.session]
-            if self.model:
-                args += ["-m", self.model]
-            args.append(prompt)
-            code, text, err = self._run(args, None, should_stop)
-            parts = []
-            for line in text.splitlines():
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(ev, dict):
-                    self.session = ev.get("sessionID") or ev.get("session_id") or self.session
-                    p = ev.get("part") or {}
-                    if isinstance(p, dict) and p.get("type") == "text" and p.get("text"):
-                        parts.append(p["text"])
-                    elif ev.get("type") == "text" and ev.get("text"):
-                        parts.append(ev["text"])
-            if parts:
-                return "\n".join(parts)
-            if text.strip():
-                return text.strip()
-            raise RuntimeError("OpenCode gave no reply" + (": " + err.strip()[-400:] if err.strip() else f" (exit code {code})"))
         if self.planner in ("codebuddy", "tcloud"):
             if not self.session and not self.raw:
-                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
+                prompt = self._system_prompt(self.allow_shell) + "\n\n# The user's request\n\n" + prompt
             if self.planner == "codebuddy":
                 args = ["-p", "--output-format", "json"]
                 if self.session:
@@ -495,7 +574,7 @@ def run(planner, text, delegate, show, should_stop=lambda: False, on_plan=lambda
             after_turn()
 
     reply = ask(text)
-    if planner.solo:
+    if planner.solo and not planner.providers_info:
         show(reply.strip() or "[no reply]")
         return
     for _ in range(MAX_HANDOFFS):

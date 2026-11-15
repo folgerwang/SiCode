@@ -19,10 +19,12 @@ def _first(paths):
     return next((p for p in paths if os.path.exists(p)), paths[-1])
 
 
+_EXE_NAME = "qwen.exe" if os.name == "nt" else "qwen"
 # The engine: SICODE_ENGINE, a build in a checkout of the repository, or the one shipped inside the wheel.
 DEFAULT_EXE = os.environ.get("SICODE_ENGINE") or _first([
-    os.path.join(REPO, "build", "Release", "qwen.exe"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", "qwen.exe")])
+    os.path.join(REPO, "build", "Release", _EXE_NAME),
+    os.path.join(REPO, "build", _EXE_NAME),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", _EXE_NAME)])
 # The model: SICODE_MODEL, the checkout's models folder, or the download folder in the user's home.
 DEFAULT_MODEL = os.environ.get("SICODE_MODEL") or _first([
     os.path.join(REPO, "models", MODEL_DIR, MODEL_QUANT),

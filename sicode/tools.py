@@ -9,6 +9,57 @@ import time
 
 MAX_OUT = 20000  # characters of tool output handed back to a model
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist", ".vs", "models", ".pytest_cache"}
+MEDIA_EXTS = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+    ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+}
+
+
+def read_clipboard_media(dest_dir):
+    """Read image or copied image/video files from the Windows clipboard into dest_dir."""
+    if os.name != "nt":
+        return []
+    import json as _json
+    os.makedirs(dest_dir, exist_ok=True)
+    clip_png = os.path.join(dest_dir, f"clip_{int(time.time() * 1000)}.png")
+    ps = (
+        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+        "$out = @(); "
+        "if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) { "
+        "  foreach ($f in [System.Windows.Forms.Clipboard]::GetFileDropList()) { $out += $f } "
+        "} elseif ([System.Windows.Forms.Clipboard]::ContainsImage()) { "
+        "  $img = [System.Windows.Forms.Clipboard]::GetImage(); "
+        f"  $img.Save('{clip_png.replace(chr(39), chr(39)*2)}', [System.Drawing.Imaging.ImageFormat]::Png); "
+        f"  $out += '{clip_png.replace(chr(39), chr(39)*2)}'; "
+        "} "
+        "$out | ConvertTo-Json -Compress"
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+                           capture_output=True, text=True, timeout=8, creationflags=flags)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    raw = (r.stdout or "").strip()
+    if not raw:
+        return []
+    try:
+        paths = _json.loads(raw)
+    except ValueError:
+        return []
+    if isinstance(paths, str):
+        paths = [paths]
+    items = []
+    for p in paths:
+        if not isinstance(p, str) or not os.path.isfile(p):
+            continue
+        ext = os.path.splitext(p)[1].lower()
+        mime = MEDIA_EXTS.get(ext)
+        if mime:
+            items.append({"name": os.path.basename(p), "mime": mime, "path": p})
+    return items
 
 
 def clip(text, limit=MAX_OUT):
