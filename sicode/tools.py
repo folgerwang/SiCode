@@ -2,7 +2,10 @@
 import fnmatch
 import os
 import re
+import signal
 import subprocess
+import tempfile
+import time
 
 MAX_OUT = 20000  # characters of tool output handed back to a model
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", "dist", ".vs", "models", ".pytest_cache"}
@@ -15,6 +18,24 @@ def clip(text, limit=MAX_OUT):
     return text[:half] + f"\n... [{len(text) - limit} characters omitted] ...\n" + text[-half:]
 
 
+def _kill_tree(pid):
+    """Terminate a process and all of its descendants."""
+    if not pid:
+        return
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
 class Workspace:
     """The project directory and the tools that act on it.
 
@@ -22,11 +43,14 @@ class Workspace:
     runs and before a file changes (old is None for a new file). show_plan(text) displays the task list.
     """
 
-    def __init__(self, root, approve_command, approve_edit=lambda path, old, new: True, show_plan=lambda text: None):
+    def __init__(self, root, approve_command, approve_edit=lambda path, old, new: True, show_plan=lambda text: None,
+                 should_stop=lambda: False):
         self.root = os.path.realpath(root)
         self.approve_command = approve_command
         self.approve_edit = approve_edit
         self.show_plan = show_plan
+        self.should_stop = should_stop
+        self._active_proc = None
         self.changed = set()   # files written since the caller last cleared it
         self.backups = {}      # path -> content before the first change since begin_turn() (None: did not exist)
 
@@ -166,15 +190,42 @@ class Workspace:
                 continue
         return clip("\n".join(out)) if out else "no matches"
 
+    def kill_command(self):
+        proc = self._active_proc
+        if proc is not None and proc.poll() is None:
+            _kill_tree(proc.pid)
+
     def run_command(self, command, timeout=300):
         if not self.approve_command(command):
             return "error: the user declined to run this command"
-        try:
-            r = subprocess.run(command, shell=True, cwd=self.root, capture_output=True, timeout=int(timeout),
-                               encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL)
-        except subprocess.TimeoutExpired:
-            return f"error: the command did not finish within {timeout} s"
-        return clip(f"exit code {r.returncode}\n{r.stdout}{r.stderr}".rstrip())
+        # Redirect to a temp file rather than a pipe: on Windows, `start /b ...` children inherit stdout/stderr
+        # handles and would otherwise keep a pipe open indefinitely after the top-level shell exits.
+        limit = max(1, int(timeout))
+        with tempfile.TemporaryFile(mode="w+b") as out_file:
+            kw = {"shell": True, "cwd": self.root, "stdin": subprocess.DEVNULL,
+                  "stdout": out_file, "stderr": subprocess.STDOUT}
+            if os.name != "nt":
+                kw["start_new_session"] = True
+            proc = subprocess.Popen(command, **kw)
+            self._active_proc = proc
+            deadline = time.monotonic() + limit
+            try:
+                while proc.poll() is None:
+                    if self.should_stop():
+                        _kill_tree(proc.pid)
+                        raise KeyboardInterrupt
+                    if time.monotonic() >= deadline:
+                        _kill_tree(proc.pid)
+                        return f"error: the command did not finish within {timeout} s"
+                    time.sleep(0.1)
+                out_file.seek(0)
+                output = out_file.read().decode("utf-8", errors="replace")
+            finally:
+                if self._active_proc is proc:
+                    self._active_proc = None
+                if proc.poll() is None:
+                    _kill_tree(proc.pid)
+        return clip(f"exit code {proc.returncode}\n{output}".rstrip())
 
     def update_plan(self, plan):
         self.show_plan(plan)

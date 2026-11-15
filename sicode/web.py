@@ -95,6 +95,8 @@ class Task:
         self.title = "New task"
         self.workspace = workspace
         self.created = time.time()
+        self.elapsed = 0.0
+        self.started = None
         self.items = []
         self.rev = 0
         self.summary = ""      # replaces the transcript as the seed of the next local conversation (compact)
@@ -104,12 +106,14 @@ class Task:
         self.changed = {}      # path -> content before the task first changed it (None: new file)
 
     def head(self):
-        return {"id": self.id, "title": self.title, "workspace": self.workspace, "created": self.created}
+        return {"id": self.id, "title": self.title, "workspace": self.workspace, "created": self.created,
+                "elapsed": self.elapsed, "started": self.started}
 
     def save(self):
         os.makedirs(TASKS_DIR, exist_ok=True)
         with open(os.path.join(TASKS_DIR, self.id + ".json"), "w", encoding="utf-8") as f:
-            json.dump({**self.head(), "items": self.items, "summary": self.summary, "sessions": self.sessions}, f)
+            json.dump({**self.head(), "started": None, "items": self.items, "summary": self.summary,
+                       "sessions": self.sessions}, f)
 
     @staticmethod
     def load(path):
@@ -117,6 +121,7 @@ class Task:
             d = json.load(f)
         t = Task(d["workspace"], d["id"])
         t.title, t.created, t.items, t.summary = d["title"], d["created"], d["items"], d.get("summary", "")
+        t.elapsed = float(d.get("elapsed") or 0.0)
         t.sessions = d.get("sessions") or {}
         for it in t.items:  # nothing is still running or waiting after a restart
             if it.get("status") in ("pending", "running"):
@@ -151,6 +156,7 @@ class Web:
         self.engine_task = None   # the task whose conversation the engine holds
         self.local_open = False
         self.busy = None          # id of the task being worked on
+        self.run_id = 0           # incremented on each run and on force-stop so stale threads cannot clobber state
         self.stop = False
         self.waiting = {}         # approval item id -> [threading.Event, answer]
         self.client = self.anthropic = None
@@ -166,7 +172,9 @@ class Web:
         if cfg.get("agy_model") and "agy" not in self.planner_models:
             self.planner_models["agy"] = cfg["agy_model"]
         self.planner_efforts = dict(cfg.get("planner_efforts") or {})
+        self.watchdog_minutes = float(cfg.get("watchdog_minutes", 10))
         self.planner_chat = None  # the Claude Code, Codex or Antigravity run in progress
+        self.monitor_chat = None  # cloud watchdog check in progress
         self.load_tasks()
 
     def load_tasks(self):
@@ -192,6 +200,7 @@ class Web:
         e = self.engine
         return {"version": __version__, "mode": self.mode, "modes": MODES, "model": self.a.model, "effort": self.a.effort,
                 "busy": self.busy, "key": have_credentials(), "planner": self.planner, "vram_cap": vram_cap(self.a),
+                "watchdog_minutes": self.watchdog_minutes,
                 "local_model": self.a.worker_model, "local_models": local_models(),
                 "planner_models": self.planner_models, "planner_efforts": self.planner_efforts,
                 "agy_models": planners.agy_base_models(),
@@ -228,6 +237,8 @@ class Web:
         t = self.task
         with self.lock:
             item["id"] = len(t.items)
+            if item.get("status") == "running" and "ts" not in item:
+                item["ts"] = time.time()
             if self.sub:
                 item["sub"] = True
             if self.by and item["type"] in ("diff", "command", "tool", "delegate"):
@@ -247,6 +258,10 @@ class Web:
     def update(self, item, **fields):
         t = self.task
         with self.lock:
+            if fields.get("status") == "running" and "ts" not in item and "ts" not in fields:
+                fields["ts"] = time.time()
+            elif fields.get("status") in ("done", "error", "stopped", "applied", "declined") and item.get("ts") and "dur" not in item and "dur" not in fields:
+                fields["dur"] = round(max(0.0, time.time() - item["ts"]), 1)
             item.update(fields)
             t.rev += 1
             self.send({"op": "update", "task": t.id, "rev": t.rev, "id": item["id"], "fields": fields})
@@ -383,13 +398,112 @@ class Web:
                 self.usage["local"] += data["gen_tokens"]
                 self.push_state()
 
+        def _run_watchdog():
+            done_ev = threading.Event()
+            if self.watchdog_minutes > 0:
+                threading.Thread(
+                    target=self._local_watchdog,
+                    args=(self.task, text, self.run_id, done_ev),
+                    daemon=True,
+                ).start()
+            return done_ev
+
+        wd_done = _run_watchdog()
         try:
             return run_task(engine, self.ws, text, on_event, effort=self.a.worker_effort, fresh=fresh, prompt=prompt,
                             instructions=self.instructions()[1], stream=True)
         finally:
+            wd_done.set()
             for it in cur.values():
                 if it is not None and it.get("status") == "running":
                     self.update(it, status="done")
+
+    def _cloud_check(self, prompt, should_stop):
+        if self.planner == "api":
+            if not have_credentials():
+                raise RuntimeError("no Claude API key configured")
+            if self.anthropic is None:
+                self.anthropic = load_anthropic()
+            if self.client is None:
+                self.client = self.anthropic.Anthropic()
+            msg = self.client.messages.create(
+                model=self.a.model, max_tokens=256,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return "".join(b.text for b in msg.content if b.type == "text")
+        if not planners.find(self.planner):
+            raise RuntimeError(f"{self.planner} is not installed")
+        chat = planners.Planner(
+            self.planner, self.task.workspace,
+            model=self.planner_models.get(self.planner) or None,
+            effort="low", solo=True, allow_shell=False, raw=True,
+        )
+        self.monitor_chat = chat
+        try:
+            return chat.ask(prompt, should_stop=should_stop)
+        finally:
+            if self.monitor_chat is chat:
+                self.monitor_chat = None
+
+    @staticmethod
+    def _parse_monitor_decision(reply):
+        import re
+        raw = (reply or "").strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                act = str(data.get("action", "")).strip().lower()
+                reason = str(data.get("reason", "")).strip() or "no reason given"
+                if act in ("wait", "stop"):
+                    return act, reason
+            except ValueError:
+                pass
+        low = raw.lower()
+        act = "stop" if re.search(r"\bstop\b", low) and not re.search(r"\bwait\b", low) else "wait"
+        return act, (raw.splitlines()[0][:160] if raw else "no details")
+
+    def _local_watchdog(self, task, request_text, rid, done_ev):
+        interval = max(10.0, self.watchdog_minutes * 60.0)
+        t_start = time.monotonic()
+        while not done_ev.wait(interval):
+            if self.stop or self.run_id != rid or self.busy != task.id:
+                return
+            if self.waiting:
+                continue
+            elapsed_m = (time.monotonic() - t_start) / 60.0
+            lines = []
+            for it in task.items[-15:]:
+                tp = it.get("type", "")
+                st = it.get("status", "")
+                if tp == "command":
+                    lines.append(f"- command [{st}]: {str(it.get('command', ''))[:160]} | {str(it.get('exit', ''))} | {str(it.get('output', ''))[:200]}")
+                elif tp == "tool":
+                    lines.append(f"- tool {it.get('name')} [{st}]: {str(it.get('args', ''))[:120]}")
+                elif tp in ("assistant", "think", "note", "error"):
+                    lines.append(f"- {tp} [{st}]: {str(it.get('text', ''))[-200:]}")
+            prompt = (
+                f"You are monitoring a local coding model job that has been running for {elapsed_m:.1f} minutes.\n"
+                f"Decide whether it is making genuine progress (wait) or is stuck/hung/looping (stop).\n\n"
+                f"Original request:\n{request_text[:800]}\n\n"
+                f"Recent activity (newest last):\n" + ("\n".join(lines) or "(no recent items)") + "\n\n"
+                f'Reply with JSON ONLY: {{"action": "wait" or "stop", "reason": "brief explanation"}}'
+            )
+            note = self.add(type="note", text=f"Cloud monitor ({elapsed_m:.0f}m): checking local job ...", status="running")
+            try:
+                reply = self._cloud_check(prompt, lambda: done_ev.is_set() or self.stop or self.run_id != rid)
+                action, reason = self._parse_monitor_decision(reply)
+            except Exception as e:
+                self.update(note, status="done", text=f"Cloud monitor skipped: {str(e)[:160]}")
+                continue
+            if done_ev.is_set() or self.stop or self.run_id != rid:
+                self.update(note, status="done")
+                return
+            if action == "stop":
+                self.update(note, status="done", text=f"Cloud monitor: STOP — {reason}")
+                self.force_stop()
+                return
+            self.update(note, status="done", text=f"Cloud monitor: WAIT — {reason}")
 
     def local_turn(self, text, prior):
         t = self.task
@@ -573,10 +687,12 @@ class Web:
                     out += f"\n\n<file path=\"{self.ws.rel(p)}\">\n{clip(f.read())}\n</file>"
         return out
 
-    def work(self, task, text, route):
+    def work(self, task, text, route, run_id=None):
         self.task, self.stop, self.sub, self.cmd_item = task, False, False, None
+        task.started = time.time()
         self.by = "c" if route == "hybrid" else ""  # hybrid: every step is marked with who did it
-        self.ws = Workspace(task.workspace, self.approve_command, self.approve_edit, self.show_plan)
+        self.ws = Workspace(task.workspace, self.approve_command, self.approve_edit, self.show_plan,
+                            should_stop=lambda: self.stop or (run_id is not None and self.run_id != run_id))
         self.ws.begin_turn()
         try:
             prior = task.transcript()
@@ -598,21 +714,89 @@ class Web:
             else:
                 self.local_turn(self.attach(text), prior)
         except KeyboardInterrupt:
-            self.add(type="note", text="Stopped.")
+            if run_id is None or self.run_id == run_id:
+                self.add(type="note", text="Stopped.")
         except Exception as e:  # shown in the task instead of killing the worker thread
-            self.add(type="error", text=str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}")
+            if run_id is None or self.run_id == run_id:
+                self.add(type="error", text=str(e) if isinstance(e, RuntimeError) else f"{type(e).__name__}: {e}")
         finally:
-            for it in task.items:
-                if it.get("status") in ("pending", "running"):
-                    self.update(it, status="stopped")
-            if self.ws.backups:
-                task.undo.append((text.strip().splitlines()[0][:60], self.ws.backups))
-            try:
-                task.save()
-            except OSError:
-                pass
-            self.busy = None
+            with self.lock:
+                if run_id is not None and self.run_id != run_id:
+                    return
+                if task.started is not None:
+                    task.elapsed += max(0.0, time.time() - task.started)
+                    task.started = None
+                for it in task.items:
+                    if it.get("status") in ("pending", "running"):
+                        self.update(it, status="stopped")
+                if self.ws.backups:
+                    task.undo.append((text.strip().splitlines()[0][:60], self.ws.backups))
+                try:
+                    task.save()
+                except OSError:
+                    pass
+                self.busy = None
             self.push_state()
+
+    def _start_work(self, task, text, route):
+        with self.lock:
+            if self.busy:
+                return False
+            self.busy = task.id
+            self.run_id += 1
+            rid = self.run_id
+            task.started = time.time()
+        self.push_state()
+        route = {"claude": "hybrid", "mix": "hybrid"}.get(route, route)  # "claude": pages before 0.2.1
+        route = route if route in ("hybrid", "cloud") else "local"
+        threading.Thread(target=self.work, args=(task, text, route, rid), daemon=True).start()
+        return True
+
+    def force_stop(self):
+        with self.lock:
+            self.stop = True
+            self.run_id += 1
+            for ev in list(self.waiting.values()):
+                ev[1] = "no"
+                ev[0].set()
+            if self.ws:
+                try:
+                    self.ws.kill_command()
+                except Exception:
+                    pass
+            if self.planner_chat:
+                try:
+                    self.planner_chat.stop()
+                except Exception:
+                    pass
+            if self.monitor_chat:
+                try:
+                    self.monitor_chat.stop()
+                except Exception:
+                    pass
+            if self.engine:
+                try:
+                    self.engine.close()
+                except Exception:
+                    pass
+                self.engine = None
+                self.engine_task = None
+            t = self.tasks.get(self.busy) if self.busy else None
+            if t:
+                self.task = t
+                if t.started is not None:
+                    t.elapsed += max(0.0, time.time() - t.started)
+                    t.started = None
+                for it in t.items:
+                    if it.get("status") in ("pending", "running"):
+                        self.update(it, status="stopped")
+                self.add(type="note", text="Force stopped.")
+                try:
+                    t.save()
+                except OSError:
+                    pass
+            self.busy = None
+        self.push_state()
 
     # --- what the page asks for ---
 
@@ -637,23 +821,35 @@ class Web:
             text = (body.get("text") or "").strip()
             if not t or not text:
                 return {"error": "nothing to send"}
-            with self.lock:
-                if self.busy:
-                    return {"error": "another request is still running"}
-                self.busy = t.id
-            self.push_state()
-            route = {"claude": "hybrid", "mix": "hybrid"}.get(body.get("route"), body.get("route"))  # "claude": pages before 0.2.1
-            route = route if route in ("hybrid", "cloud") else "local"
-            threading.Thread(target=self.work, args=(t, text, route), daemon=True).start()
+            if not self._start_work(t, text, body.get("route")):
+                return {"error": "another request is still running"}
             return {"ok": True}
         if path == "/api/stop":
             if self.busy:
                 self.stop = True
+                if self.ws:
+                    self.ws.kill_command()
                 if self.engine:
                     self.engine.interrupt()
                 if self.planner_chat:
                     self.planner_chat.stop()
             return {"ok": bool(self.busy)}
+        if path == "/api/force-stop":
+            self.force_stop()
+            return {"ok": True}
+        if path == "/api/restart":
+            t = self.tasks.get(body.get("task", "")) or (self.tasks.get(self.busy) if self.busy else None)
+            if not t:
+                return {"error": "no such task"}
+            last_user = next((it for it in reversed(t.items) if it.get("type") == "user"), None)
+            text = (body.get("text") or (last_user.get("text") if last_user else "") or "").strip()
+            if not text:
+                return {"error": "nothing to restart"}
+            route = body.get("route") or (last_user.get("route") if last_user else "local")
+            if self.busy:
+                self.force_stop()
+            self._start_work(t, text, route)
+            return {"ok": True}
         if path == "/api/approve":
             ev = self.waiting.get(body.get("id"))
             if ev:
@@ -665,6 +861,18 @@ class Web:
                 self.mode = body["mode"]
             self.push_state()
             return {"mode": self.mode}
+        if path == "/api/watchdog":
+            try:
+                mins = max(0.0, float(body.get("minutes", 0)))
+            except (TypeError, ValueError):
+                return {"error": "invalid minutes"}
+            self.watchdog_minutes = mins
+            try:
+                save_config(watchdog_minutes=mins)
+            except OSError:
+                pass
+            self.push_state()
+            return {"watchdog_minutes": self.watchdog_minutes}
         if path == "/api/model":
             p = body.get("planner")
             if p in planners.PLANNERS and p != "api":

@@ -188,16 +188,22 @@ def split_reply(text):
 class Planner:
     """One conversation with Claude Code or Codex, run non-interactively in the workspace."""
 
-    def __init__(self, planner, cwd, model=None, effort=None, session=None, solo=False, allow_shell=False):
+    def __init__(self, planner, cwd, model=None, effort=None, session=None, solo=False, allow_shell=False, raw=False):
         self.planner, self.cwd, self.model, self.effort = planner, cwd, model, effort
         self.solo = solo                # the tool does the work itself instead of handing it to the local model
         self.allow_shell = allow_shell  # solo: it may also run shell commands
+        self.raw = raw                  # single-turn non-coding prompt (e.g. watchdog check)
         self.session = session   # the tool's own session id, to continue the conversation
         self.proc = None
 
     def stop(self):
         if self.proc and self.proc.poll() is None:
-            self.proc.kill()
+            from .tools import _kill_tree
+            _kill_tree(self.proc.pid)
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
 
     def _run(self, args, prompt, should_stop):
         exe = find(self.planner)
@@ -220,7 +226,7 @@ class Planner:
             t1.start(); t2.start()
             while self.proc.poll() is None:
                 if should_stop():
-                    self.proc.kill()
+                    self.stop()
                     raise KeyboardInterrupt
                 time.sleep(0.2)
             t1.join(5); t2.join(5)
@@ -234,11 +240,14 @@ class Planner:
     def ask(self, prompt, should_stop=lambda: False):
         """Sends one message and returns the planner's reply text."""
         if self.planner == "claude-code":
-            tools = "Read,Grep,Glob,Edit,Write" + (",Bash" if self.allow_shell else "")
-            args = ["-p", "--output-format", "json", "--tools", tools, "--permission-mode", "acceptEdits",
-                    "--append-system-prompt", SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell)]
-            if self.allow_shell:
-                args += ["--allowedTools", "Bash"]
+            if self.raw:
+                args = ["-p", "--output-format", "json", "--tools", ""]
+            else:
+                tools = "Read,Grep,Glob,Edit,Write" + (",Bash" if self.allow_shell else "")
+                args = ["-p", "--output-format", "json", "--tools", tools, "--permission-mode", "acceptEdits",
+                        "--append-system-prompt", SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell)]
+                if self.allow_shell:
+                    args += ["--allowedTools", "Bash"]
             if self.session:
                 args += ["--resume", self.session]
             if self.model:
@@ -265,7 +274,8 @@ class Planner:
                 args = ["exec", "resume", self.session, "-", "--json", "--skip-git-repo-check"]
             else:
                 args = ["exec", "--json", "--skip-git-repo-check", "-"]
-                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(True)) + "\n\n# The user's request\n\n" + prompt
+                if not self.raw:
+                    prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(True)) + "\n\n# The user's request\n\n" + prompt
             # Codex edits and runs commands inside its own sandbox, limited to the workspace
             args += ["-c", 'sandbox_mode="workspace-write"']
             if self.model:
@@ -290,7 +300,7 @@ class Planner:
                                    + " (run `codex login` in a terminal to sign in, if that is the problem)")
             return reply[-1]
         if self.planner == "agy":
-            if not self.session:
+            if not self.session and not self.raw:
                 prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell)) + "\n\n# The user's request\n\n" + prompt
             args = ["--output-format", "json", "--mode", "accept-edits"]
             if self.allow_shell:
