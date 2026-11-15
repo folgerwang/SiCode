@@ -59,6 +59,7 @@ HELP = f"""{BOLD}Requests{OFF}
   /paste           attach image or video from clipboard (or press Alt+V while typing)
   /think           show or hide the local model's reasoning
   /key             set the Claude API key
+  /update [check]  check GitHub for a newer SiCode release (and install it)
   /exit            quit"""
 
 INIT_REQUEST = """Explore this repository and write SICODE.md at its root: the notes an assistant should read before \
@@ -886,6 +887,26 @@ class App:
             else:
                 self.pending_media.extend(items)
                 print(f"{DIM}attached from clipboard: {', '.join(it['name'] for it in items)}{OFF}")
+        elif name == "/update":
+            from . import updater
+            print(f"{DIM}checking GitHub for SiCode updates (current v{__version__}) ...{OFF}")
+            info = updater.check_update()
+            if info.get("error"):
+                print(f"{RED}update check failed: {info['error']}{OFF}")
+            elif not info.get("has_update"):
+                print(f"{GREEN}SiCode v{__version__} is up to date (latest: v{info['latest']}).{OFF}")
+            else:
+                print(f"{CYAN}New version available: v{info['latest']} ({info.get('wheel_name') or info['tag']}){OFF}")
+                if arg == "check":
+                    print(f"{DIM}Run /update or `sicode --update` to install.{OFF}")
+                else:
+                    ans = input("Install update now? [Y/n] ").strip().lower()
+                    if ans in ("", "y", "yes"):
+                        res = updater.apply_update(info.get("wheel_url"))
+                        if res["ok"]:
+                            print(f"{GREEN}Updated to v{info['latest']}. Restart sicode to use the new version.{OFF}")
+                        else:
+                            print(f"{RED}Update failed:{OFF}\n{res['output']}")
         else:
             print(f"{RED}unknown command {name}; /help lists them{OFF}")
         return True
@@ -1017,8 +1038,23 @@ def main():
     ap.add_argument("--no-browser", action="store_true", help="with --web: print the address, do not open it")
     ap.add_argument("--download-model", action="store_true",
                     help="download the local model (about 115 GB) to ~/.sicode/models and exit")
+    ap.add_argument("--update", action="store_true",
+                    help="check GitHub for a newer SiCode release and install it")
     ap.add_argument("--version", action="version", version="sicode " + __version__)
     a = ap.parse_args()
+    if a.update:
+        from . import updater
+        info = updater.check_update()
+        if info.get("error"):
+            print("Update check failed: " + info["error"])
+            return
+        if not info.get("has_update"):
+            print(f"SiCode v{__version__} is already up to date (latest: v{info['latest']}).")
+            return
+        print(f"Updating SiCode v{__version__} -> v{info['latest']} ({info.get('wheel_name') or info['tag']}) ...")
+        res = updater.apply_update(info.get("wheel_url"))
+        print(res["output"])
+        return
     if a.download_model:
         from .worker import download_model
         print("downloaded to " + download_model())

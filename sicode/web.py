@@ -1134,6 +1134,12 @@ class Web:
     def api(self, path, q, body):
         if path == "/api/state":
             return self.state()
+        if path == "/api/check-update":
+            from . import updater
+            return updater.check_update()
+        if path == "/api/update":
+            from . import updater
+            return updater.apply_update(body.get("wheel_url"))
         if path == "/api/task":
             t = self.tasks.get(q.get("id", ""))
             if not t:

@@ -228,6 +228,11 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
   <div id="recent"></div>
   <label>In this folder</label><div id="dirs" style="max-height:38vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:4px"></div></div><div class="df"><span class="dim" id="direrr" style="flex:1;font-size:12.5px;align-self:center"></span><button class="primary" id="usedir">Start a task here</button></div></dialog>
 <dialog id="setdlg"><div class="dh"><h3>Settings</h3><button class="ghost" data-close>Close</button></div><div class="db">
+  <div style="display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;margin-bottom:10px;font-size:12.5px">
+    <span style="flex:1"><strong>SiCode</strong> <span id="updcur" class="mono"></span> · <span id="updstatus" class="dim">Checking GitHub...</span></span>
+    <button id="updcheck" type="button">Check updates</button>
+    <button id="updnow" class="primary" type="button" hidden>Update</button>
+  </div>
   <label for="planner">Primary cloud model (auto-selected dynamically by ML router when Dynamic mode is on)</label><select id="planner"></select>
   <div class="dim" id="plannernote" style="font-size:12.5px;margin-top:6px"></div>
   <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text)"><input type="checkbox" id="mixauto" style="width:auto"> Dynamic cloud selection: auto-select primary provider &amp; effort from our trained ML model</label>
@@ -850,6 +855,30 @@ function makeProviderEffortSelect(pId) {
   if (curEffort && ef.value !== curEffort) { ef.append(new Option(curEffort, curEffort)); ef.value = curEffort; }
   return ef;
 }
+let _updWheelUrl = '';
+async function checkUpdateUI() {
+  $('updcur').textContent = 'v' + st.version;
+  $('updstatus').textContent = 'Checking GitHub...';
+  $('updnow').hidden = true;
+  const r = await api('/api/check-update');
+  if (r.error) { $('updstatus').textContent = 'Check failed: ' + r.error; return; }
+  if (!r.has_update) {
+    $('updstatus').textContent = 'Up to date (latest v' + r.latest + ')';
+  } else {
+    _updWheelUrl = r.wheel_url || '';
+    $('updstatus').textContent = 'Update available: v' + r.latest;
+    $('updnow').textContent = 'Update to v' + r.latest;
+    $('updnow').hidden = !_updWheelUrl;
+  }
+}
+$('updcheck').onclick = () => checkUpdateUI();
+$('updnow').onclick = async () => {
+  $('updnow').disabled = true; $('updnow').textContent = 'Updating...';
+  const r = await api('/api/update', {wheel_url: _updWheelUrl});
+  $('updnow').disabled = false;
+  if (r.ok) { $('updstatus').textContent = 'Updated! Restart SiCode to apply.'; $('updnow').hidden = true; }
+  else { $('updstatus').textContent = 'Update failed'; alert(r.output || 'Update failed'); }
+};
 $('planner').onchange = () => { plannerNote(); };
 $('mixauto').onchange = () => { plannerNote(); };
 $('settings').onclick = () => { const ps = $('planner'); ps.textContent = '';
@@ -896,7 +925,7 @@ $('settings').onclick = () => { const ps = $('planner'); ps.textContent = '';
   $('vramnote').textContent = 'The local model sizes its expert cache to stay under the cap; a lower cap is slower. ' +
     (lastSys && lastSys.vram ? 'The card has ' + gb(lastSys.vram[1]) + ' GB; ' + gb(lastSys.vram[0]) + ' GB are in use now. ' : '') +
     'Changing it reloads the model on the next request.';
-  $('key').value = ''; $('key').placeholder = st.key ? 'a key is set; type to replace it' : 'sk-ant-...'; $('setdlg').showModal(); };
+  $('key').value = ''; $('key').placeholder = st.key ? 'a key is set; type to replace it' : 'sk-ant-...'; $('setdlg').showModal(); checkUpdateUI(); };
 $('saveset').onclick = async () => { if ($('key').value.trim()) await api('/api/key', {key: $('key').value.trim()}); if ($('localmodel').value !== st.local_model) { const r = await api('/api/localmodel', {path: $('localmodel').value}); if (r.error) { alert(r.error); return; } }
   const cap = parseFloat($('vramcap').value); if (!isNaN(cap) && cap !== (st.vram_cap || 0)) await api('/api/vramcap', {gb: cap});
   const wd = parseFloat($('watchdog').value); if (!isNaN(wd) && wd !== (st.watchdog_minutes ?? 10)) await api('/api/watchdog', {minutes: wd});
