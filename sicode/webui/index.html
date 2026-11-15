@@ -144,7 +144,7 @@ details.think div { white-space: pre-wrap; border-left: 2px solid var(--line); p
 #info .f span { overflow: hidden; text-overflow: ellipsis; }
 #info .kids { margin-left: 14px; }
 .meter { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 6px 0; }
-.meter i { display: block; height: 100%; background: var(--accent); }
+.meter i { display: block; height: 100%; background: var(--accent); transition: width .25s ease; }
 .kv { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--dim); gap: 8px; }
 .kv b { color: var(--text); font-weight: 500; text-align: right; }
 
@@ -221,8 +221,8 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
   <label for="vramcap">Most VRAM in use on the card, in GB, counting other programs (0 = no cap)</label><input type="text" id="vramcap" inputmode="decimal" autocomplete="off">
   <div class="dim" id="vramnote" style="font-size:12.5px;margin-top:6px"></div>
   <label for="key">Claude API key (only for the "Claude API key" planner; saved in ~/.sicode/config.json)</label><input type="password" id="key" placeholder="sk-ant-..." autocomplete="off">
-  <label for="model">Claude model (Claude API key planner)</label><select id="model"><option value="claude-opus-5-5">Claude Opus 5.5</option><option value="claude-fable-5-1">Claude Fable 5.1</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5</option><option value="claude-haiku-5-5">Claude Haiku 5.5</option></select>
-  <label for="effort">Claude reasoning effort</label><select id="effort"><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select>
+  <label for="model" id="modellbl">Claude model (Claude API key planner)</label><select id="model"><option value="claude-opus-5-5">Claude Opus 5.5</option><option value="claude-fable-5-1">Claude Fable 5.1</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5</option><option value="claude-haiku-5-5">Claude Haiku 5.5</option></select>
+  <label for="effort" id="effortlbl">Claude reasoning effort</label><select id="effort"><option>low</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select>
 </div><div class="df"><button class="primary" id="saveset">Save</button></div></dialog>
 
 <script>
@@ -317,7 +317,7 @@ function view(it) {
     w.append(b);
   } else if (it.type === 'assistant') {
     const a = el('div', 'assistant');
-    if (it.who === 'claude' || it.who === 'codex') a.append(el('div', 'who', it.who === 'codex' ? 'Codex' : 'Claude'));
+    if (it.who === 'claude' || it.who === 'codex' || it.who === 'agy') a.append(el('div', 'who', {codex: 'Codex', agy: 'Antigravity'}[it.who] || 'Claude'));
     const body = el('div', 'md'); body.innerHTML = md(it.text || '');
     a.append(body); w.append(a);
   } else if (it.type === 'think') {
@@ -368,7 +368,13 @@ function view(it) {
     c.append(top, d); w.append(c);
   } else if (it.type === 'error') w.append(el('div', 'error', it.text));
   else if (it.type === 'stats') w.append(el('div', 'stats', it.text));
-  else { const n = el('div', 'note'); if (it.status === 'running') n.append(Object.assign(el('span', 'spin'), {style: 'display:inline-block;margin-right:6px'})); n.append(it.text || ''); w.append(n); }
+  else { const n = el('div', 'note'); if (it.status === 'running') n.append(Object.assign(el('span', 'spin'), {style: 'display:inline-block;margin-right:6px'})); n.append(it.text || '');
+    if (it.status === 'running' && typeof it.progress === 'number') {
+      const m = Object.assign(el('div', 'meter'), {style: 'max-width:320px;margin:8px auto 0'});
+      m.append(Object.assign(el('i'), {style: 'width:' + Math.max(2, Math.min(100, Math.round(it.progress * 100))) + '%'}));
+      n.append(m);
+    }
+    w.append(n); }
   return w;
 }
 function nearBottom() { const s = $('scroll'); return s.scrollHeight - s.scrollTop - s.clientHeight < 140; }
@@ -422,7 +428,7 @@ function renderBar() {
   if (!m.options.length) for (const k of Object.keys(st.modes)) m.append(new Option({ask: 'Ask before changes', edits: 'Ask before commands', auto: 'Never ask'}[k] || k, k));
   m.value = st.mode; m.title = st.modes[st.mode];
   const pl = st.planners.find(x => x.id === st.planner) || st.planners[0];
-  const brand = st.planner === 'codex' ? 'Codex' : 'Claude';
+  const brand = {codex: 'Codex', agy: 'Antigravity'}[st.planner] || 'Claude';
   $('cloudbtn').textContent = brand;
   $('cloudbtn').title = brand + ' does the work itself (' + pl.label + '). The local model is not used.' +
     (st.planner === 'api' ? '' : ' Its file changes are applied directly and shown afterwards; Undo puts them back.');
@@ -440,7 +446,13 @@ function renderBar() {
   if (st.usage.in || st.usage.out) c.append(kv('Claude tokens', st.usage.in.toLocaleString() + ' in, ' + st.usage.out.toLocaleString() + ' out'));
   const lmNow = st.local_models.find(m => m.path === st.local_model);
   c.append(kv('Local model', lmNow ? lmNow.label : st.local_model.split(/[\\/]/).slice(-2).join('/')));
-  c.append(kv('Cloud model', st.planner === 'api' ? st.model.replace('claude-', '') : (st.planners.find(x => x.id === st.planner) || {}).label || st.planner));
+  const pm = (st.planner_models || {})[st.planner] || '';
+  const pe = (st.planner_efforts || {})[st.planner] || '';
+  const agyLabel = (st.agy_models || []).find(m => m.id === pm)?.label || pm || 'Antigravity (default)';
+  const pLabel = st.planner === 'api' ? st.model.replace('claude-', '') + ' (' + st.effort + ')'
+    : st.planner === 'agy' ? agyLabel + (pe ? ' (' + pe + ')' : '')
+    : (pm ? pm + (pe ? ' (' + pe + ')' : '') : ((st.planners.find(x => x.id === st.planner) || {}).label || st.planner) + (pe ? ' (' + pe + ')' : ''));
+  c.append(kv('Cloud model', pLabel));
 }
 function kv(k, v) { const d = el('div', 'kv'); d.append(el('span', '', k), el('b', '', v)); return d; }
 function renderChanged() {
@@ -572,12 +584,52 @@ $('compact').onclick = () => api('/api/send', {task: cur, text: '/compact', rout
 $('fileview').onclick = e => { const b = e.target.closest('button'); if (b) showFile(b.dataset.v); };
 document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => b.closest('dialog').close());
 function plannerNote() { const p = st.planners.find(x => x.id === $('planner').value);
+  const name = {codex: 'Codex', agy: 'Antigravity'}[p.id] || 'Claude Code';
   $('plannernote').textContent = p.id === 'api' ? 'Uses the key below; billed per token by Anthropic.'
-    : p.found ? 'Uses the account you are signed in with in ' + (p.id === 'codex' ? 'Codex' : 'Claude Code') + '; no API key is involved. It can read the folder, and hands every change to the local model.'
-    : (p.id === 'codex' ? 'Codex' : 'Claude Code') + ' was not found on this computer. Install it and sign in first.'; }
-$('planner').onchange = plannerNote;
+    : p.found ? 'Uses the account you are signed in with in ' + name + '; no API key is involved. It can read the folder, and hands every change to the local model.'
+    : name + ' was not found on this computer. Install it and sign in first.'; }
+const PROVIDER_MODELS = {
+  api: [['claude-opus-5-5', 'Claude Opus 5.5'], ['claude-fable-5-1', 'Claude Fable 5.1'],
+        ['claude-sonnet-5-5', 'Claude Sonnet 5.5'], ['claude-haiku-5-5', 'Claude Haiku 5.5']],
+  'claude-code': [['', 'Default (claude)'], ['claude-opus-5-5', 'Claude Opus 5.5'],
+                  ['claude-fable-5-1', 'Claude Fable 5.1'], ['claude-sonnet-5-5', 'Claude Sonnet 5.5'],
+                  ['claude-haiku-5-5', 'Claude Haiku 5.5']],
+  codex: [['', 'Default (codex)'], ['gpt-5.4', 'GPT-5.4'], ['gpt-5.3-codex', 'GPT-5.3 Codex'],
+          ['gpt-5.2-codex', 'GPT-5.2 Codex'], ['gpt-5.1-codex-max', 'GPT-5.1 Codex Max'],
+          ['o3', 'o3'], ['o4-mini', 'o4-mini']]
+};
+const PROVIDER_EFFORTS = {
+  api: ['low', 'medium', 'high', 'xhigh', 'max'],
+  'claude-code': ['', 'low', 'medium', 'high', 'xhigh', 'max'],
+  codex: ['', 'low', 'medium', 'high', 'xhigh'],
+  agy: ['', 'low', 'medium', 'high', 'xhigh', 'max']
+};
+function fillCloudModels() {
+  const p = $('planner').value, m = $('model'), ef = $('effort');
+  const brand = {api: 'Claude API', 'claude-code': 'Claude Code', codex: 'Codex', agy: 'Antigravity'}[p] || p;
+  $('modellbl').textContent = brand + ' model';
+  $('effortlbl').textContent = brand + ' reasoning effort';
+  m.textContent = '';
+  const curModel = p === 'api' ? st.model : ((st.planner_models || {})[p] || '');
+  if (p === 'agy') {
+    m.append(new Option('Default (agy)', ''));
+    for (const x of (st.agy_models || [])) m.append(new Option(x.label, x.id));
+  } else {
+    for (const [id, label] of (PROVIDER_MODELS[p] || [])) m.append(new Option(label, id));
+  }
+  m.value = curModel;
+  if (curModel && m.value !== curModel) { m.append(new Option(curModel, curModel)); m.value = curModel; }
+  ef.textContent = '';
+  for (const lvl of (PROVIDER_EFFORTS[p] || PROVIDER_EFFORTS.api)) {
+    ef.append(new Option(lvl ? lvl : 'Default (' + p + ')', lvl));
+  }
+  const curEffort = p === 'api' ? st.effort : ((st.planner_efforts || {})[p] || '');
+  ef.value = curEffort;
+  if (curEffort && ef.value !== curEffort) { ef.append(new Option(curEffort, curEffort)); ef.value = curEffort; }
+}
+$('planner').onchange = () => { plannerNote(); fillCloudModels(); };
 $('settings').onclick = () => { const ps = $('planner'); ps.textContent = '';
-  for (const p of st.planners) ps.append(new Option(p.label + (p.found ? '' : ' (not installed)'), p.id)); ps.value = st.planner; plannerNote();
+  for (const p of st.planners) ps.append(new Option(p.label + (p.found ? '' : ' (not installed)'), p.id)); ps.value = st.planner; plannerNote(); fillCloudModels();
   const lm = $('localmodel'); lm.textContent = '';
   for (const m of st.local_models) lm.append(new Option(m.label + (m.default ? ' (default)' : ''), m.path));
   lm.value = st.local_model; if (lm.value !== st.local_model) { lm.append(new Option(st.local_model, st.local_model)); lm.value = st.local_model; }
@@ -586,10 +638,12 @@ $('settings').onclick = () => { const ps = $('planner'); ps.textContent = '';
   $('vramnote').textContent = 'The local model sizes its expert cache to stay under the cap; a lower cap is slower. ' +
     (lastSys && lastSys.vram ? 'The card has ' + gb(lastSys.vram[1]) + ' GB; ' + gb(lastSys.vram[0]) + ' GB are in use now. ' : '') +
     'Changing it reloads the model on the next request.';
-  $('model').value = st.model; if ($('model').value !== st.model) { $('model').append(new Option(st.model, st.model)); $('model').value = st.model; } $('effort').value = st.effort; $('key').value = ''; $('key').placeholder = st.key ? 'a key is set; type to replace it' : 'sk-ant-...'; $('setdlg').showModal(); };
+  $('key').value = ''; $('key').placeholder = st.key ? 'a key is set; type to replace it' : 'sk-ant-...'; $('setdlg').showModal(); };
 $('saveset').onclick = async () => { if ($('key').value.trim()) await api('/api/key', {key: $('key').value.trim()}); if ($('localmodel').value !== st.local_model) { const r = await api('/api/localmodel', {path: $('localmodel').value}); if (r.error) { alert(r.error); return; } }
   const cap = parseFloat($('vramcap').value); if (!isNaN(cap) && cap !== (st.vram_cap || 0)) await api('/api/vramcap', {gb: cap});
-  await api('/api/planner', {planner: $('planner').value}); await api('/api/model', {model: $('model').value, effort: $('effort').value}); $('setdlg').close(); };
+  await api('/api/planner', {planner: $('planner').value});
+  await api('/api/model', {planner: $('planner').value, model: $('model').value, effort: $('effort').value});
+  $('setdlg').close(); };
 let dirNow = '';
 async function showDirs(path) {
   const r = await api('/api/dirs?path=' + encodeURIComponent(path));

@@ -4,6 +4,8 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
 
 from . import sysinfo
 from .tools import TOOLS
@@ -177,7 +179,7 @@ def parse_reply(text):
 class Engine:
     """qwen.exe --pipe: one JSON request per line in, JSON lines out. The engine holds the conversation."""
 
-    def __init__(self, exe=DEFAULT_EXE, model=DEFAULT_MODEL, backend="vulkan", extra=(), vram_cap_gb=0):
+    def __init__(self, exe=DEFAULT_EXE, model=DEFAULT_MODEL, backend="vulkan", extra=(), vram_cap_gb=0, on_progress=None):
         """vram_cap_gb: the most VRAM that may be in use on the card, counting other programs (0: no cap)."""
         if not os.path.exists(exe):
             raise RuntimeError(f"{exe} not found: build the engine (setup.bat) or set SICODE_ENGINE")
@@ -201,7 +203,37 @@ class Engine:
         self.proc = subprocess.Popen([os.path.abspath(exe), "--pipe", "--model", os.path.abspath(model), "--backend", backend, *extra],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                                      creationflags=flags, env=env)
-        self.ctx = self._read()["ctx"]
+        done = threading.Event()
+        if on_progress is not None:
+            stages = [
+                ("ready in", 0.98, "finalizing"),
+                ("touched", 0.90, "warming expert weights in RAM"),
+                ("preloaded", 0.70, "preloading hot experts"),
+                ("expert cache", 0.50, "allocating expert cache"),
+                ("VRAM:", 0.45, "sizing VRAM"),
+                ("dense weights", 0.35, "uploading dense weights"),
+                ("[vulkan]", 0.15, "initializing GPU"),
+                ("[cpu]", 0.25, "loading model on CPU"),
+            ]
+            def _watch():
+                last_pct = 0.0
+                while not done.is_set():
+                    try:
+                        with open(self.log_path, encoding="utf-8", errors="replace") as f:
+                            text = f.read()
+                        for needle, pct, label in stages:
+                            if needle in text and pct > last_pct:
+                                last_pct = pct
+                                on_progress(pct, label)
+                                break
+                    except OSError:
+                        pass
+                    done.wait(0.15)
+            threading.Thread(target=_watch, daemon=True).start()
+        try:
+            self.ctx = self._read()["ctx"]
+        finally:
+            done.set()
         self.ctx_used = 0
         self.cache = {"hits": 0, "misses": 0, "last": None, "cached": 0, "experts": 0}
 

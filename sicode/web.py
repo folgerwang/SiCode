@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import secrets
+import socket
 import string
 import threading
 import time
@@ -158,9 +159,14 @@ class Web:
         self.cmd_item = None
         self.sub = False          # inside a delegated task
         self.by = ""              # hybrid: who is acting now, "c" (the cloud model) or "l" (the local model)
-        self.planner = a.planner if a.planner != "auto" else load_config().get("planner") or \
+        cfg = load_config()
+        self.planner = a.planner if a.planner != "auto" else cfg.get("planner") or \
             planners.default_planner(have_credentials())
-        self.planner_chat = None  # the Claude Code or Codex run in progress
+        self.planner_models = dict(cfg.get("planner_models") or {})
+        if cfg.get("agy_model") and "agy" not in self.planner_models:
+            self.planner_models["agy"] = cfg["agy_model"]
+        self.planner_efforts = dict(cfg.get("planner_efforts") or {})
+        self.planner_chat = None  # the Claude Code, Codex or Antigravity run in progress
         self.load_tasks()
 
     def load_tasks(self):
@@ -187,6 +193,8 @@ class Web:
         return {"version": __version__, "mode": self.mode, "modes": MODES, "model": self.a.model, "effort": self.a.effort,
                 "busy": self.busy, "key": have_credentials(), "planner": self.planner, "vram_cap": vram_cap(self.a),
                 "local_model": self.a.worker_model, "local_models": local_models(),
+                "planner_models": self.planner_models, "planner_efforts": self.planner_efforts,
+                "agy_models": planners.agy_base_models(),
                 "planners": [{"id": k, "label": v, "found": k == "api" or bool(planners.find(k))}
                              for k, v in planners.PLANNERS.items()], "default_workspace": os.path.realpath(self.a.dir),
                 "engine": bool(e), "ctx": e.ctx if e else 0,
@@ -318,11 +326,14 @@ class Web:
         if self.engine is None:
             name = next((m["label"] for m in local_models() if os.path.normcase(m["path"]) ==
                          os.path.normcase(self.a.worker_model)), os.path.basename(self.a.worker_model))
-            note = self.add(type="note", text=f"Loading the local model {name} ...", status="running")
+            note = self.add(type="note", text=f"Loading the local model {name} ...", status="running", progress=0.05)
             t0 = time.time()
-            self.engine = Engine(self.a.exe, self.a.worker_model, self.a.backend, vram_cap_gb=vram_cap(self.a))
+            self.engine = Engine(
+                self.a.exe, self.a.worker_model, self.a.backend, vram_cap_gb=vram_cap(self.a),
+                on_progress=lambda pct, stage: self.update(note, text=f"Loading {name}: {stage} ...", progress=pct),
+            )
             self.update(note, text=f"{name} ready in {time.time() - t0:.0f} s "
-                                   f"(context {self.engine.ctx:,} tokens)", status="done")
+                                   f"(context {self.engine.ctx:,} tokens)", status="done", progress=1.0)
         return self.engine
 
     def instructions(self):
@@ -511,10 +522,12 @@ class Web:
         t = self.task
         label = planners.PLANNERS[self.planner]
         key = self.planner + (":solo" if solo else "")
-        chat = planners.Planner(self.planner, t.workspace, session=t.sessions.get(key), solo=solo,
-                                allow_shell=self.mode == "auto")
+        chat = planners.Planner(self.planner, t.workspace,
+                                model=self.planner_models.get(self.planner) or None,
+                                effort=self.planner_efforts.get(self.planner) or None,
+                                session=t.sessions.get(key), solo=solo, allow_shell=self.mode == "auto")
         self.planner_chat = chat
-        who = "claude" if self.planner == "claude-code" else "codex"
+        who = {"claude-code": "claude", "codex": "codex", "agy": "agy"}.get(self.planner, "claude")
         note = [None]
         snap = [None]
 
@@ -653,12 +666,24 @@ class Web:
             self.push_state()
             return {"mode": self.mode}
         if path == "/api/model":
+            p = body.get("planner")
+            if p in planners.PLANNERS and p != "api":
+                if "model" in body:
+                    self.planner_models[p] = str(body["model"] or "")
+                if "effort" in body:
+                    self.planner_efforts[p] = str(body["effort"] or "")
+                try:
+                    save_config(planner_models=self.planner_models, planner_efforts=self.planner_efforts)
+                except OSError:
+                    pass
+                self.push_state()
+                return {"model": self.planner_models.get(p, ""), "effort": self.planner_efforts.get(p, "")}
             if body.get("model"):
                 self.a.model = MODEL_ALIASES.get(body["model"].lower(), body["model"])
             if body.get("effort") in ("low", "medium", "high", "xhigh", "max"):
                 self.a.effort = body["effort"]
             self.push_state()
-            return {"model": self.a.model}
+            return {"model": self.a.model, "effort": self.a.effort}
         if path == "/api/localmodel":
             chosen = next((m for m in local_models() if m["path"] == body.get("path")), None)
             if not chosen:
@@ -895,6 +920,28 @@ def make_handler(web, token):
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def _bind_server(port, handler_cls):
+    """Bind on `port`, or fall back to the next free port (then OS-assigned) if occupied."""
+    if port == 0:
+        return _Server(("127.0.0.1", 0), handler_cls)
+    for candidate in list(range(port, min(port + 20, 65536))) + [0]:
+        try:
+            return _Server(("127.0.0.1", candidate), handler_cls)
+        except OSError:
+            continue
+    return _Server(("127.0.0.1", 0), handler_cls)
+
+
 def serve(a):
     load_saved_key()
     cfg = load_config()
@@ -907,8 +954,9 @@ def serve(a):
             pass
     web = Web(a)
     threading.Thread(target=web.tick, daemon=True).start()
-    server = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(web, token))
-    server.daemon_threads = True
+    server = _bind_server(a.port, make_handler(web, token))
+    if a.port and server.server_address[1] != a.port:
+        print(f"port {a.port} is in use, using {server.server_address[1]}")
     url = f"http://127.0.0.1:{server.server_address[1]}/?t={token}"
     print(f"SiCode {__version__} in the browser: {url}\nworkspace {os.path.realpath(a.dir)}; Ctrl+C here stops it")
     if not a.no_browser:

@@ -52,7 +52,7 @@ HELP = f"""{BOLD}Requests{OFF}
   /mode [name]     permission mode: ask, edits, auto
   /model [name]    Claude model for [c]: opus, sonnet, haiku, fable or a full model id
   /local [number]  the local model: lists the installed ones, or switches to one
-  /planner [name]  who plans [c] requests: api (Claude API key), claude-code or codex (account login)
+  /planner [name]  who plans [c] requests: api (Claude API key), claude-code, codex or agy (account login)
   /think           show or hide the local model's reasoning
   /key             set the Claude API key
   /exit            quit"""
@@ -780,8 +780,8 @@ def main():
     ap.add_argument("--backend", default="vulkan", choices=["vulkan", "cpu"], help="where the local model runs")
     ap.add_argument("-p", "--prompt", help="run one request and exit; may start with [l] local, [c] cloud or [m] mix")
     ap.add_argument("--planner", default="auto", choices=["auto", *planners.PLANNERS],
-                    help="who plans [c] requests: the Claude API key, or an account login through Claude Code or "
-                         "Codex (default: the last choice, else an installed login tool)")
+                    help="who plans [c] requests: the Claude API key, or an account login through Claude Code, Codex "
+                         "or Antigravity (default: the last choice, else an installed login tool)")
     ap.add_argument("--web", action="store_true", help="open SiCode as a page in the browser instead of the terminal")
     ap.add_argument("--port", type=int, default=8765, help="port of the --web page (default 8765; 0 picks a free one)")
     ap.add_argument("--no-browser", action="store_true", help="with --web: print the address, do not open it")

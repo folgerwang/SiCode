@@ -21,6 +21,7 @@ PLANNERS = {
     "api": "Claude API key",
     "claude-code": "Claude account (through Claude Code)",
     "codex": "ChatGPT account (through Codex)",
+    "agy": "Google account (through Antigravity)",
 }
 
 SPLIT = """Two of you do the work, and every step of the job goes to one of you:
@@ -90,14 +91,71 @@ STEP_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:\[([ xX~])\]\s*)?(?:\[([lLcC])\]\s*)?(
 MAX_HANDOFFS = 12
 
 
+_AGY_MODELS_CACHE = None
+
+
+def agy_models():
+    """Return [{id, label}] from `agy models`, cached for the process lifetime."""
+    global _AGY_MODELS_CACHE
+    if _AGY_MODELS_CACHE is not None:
+        return _AGY_MODELS_CACHE
+    exe = find("agy")
+    if not exe:
+        _AGY_MODELS_CACHE = []
+        return _AGY_MODELS_CACHE
+    try:
+        out = subprocess.check_output([exe, "models"], stderr=subprocess.DEVNULL, timeout=5).decode("utf-8", errors="replace")
+        models = []
+        for line in out.splitlines():
+            if "\t" in line:
+                mid, label = line.split("\t", 1)
+                mid, label = mid.strip(), label.strip()
+                if mid:
+                    models.append({"id": mid, "label": label or mid})
+        _AGY_MODELS_CACHE = models
+    except Exception:
+        _AGY_MODELS_CACHE = []
+    return _AGY_MODELS_CACHE
+
+
+_EFFORT_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh|max)$")
+_EFFORT_LABEL_RE = re.compile(r"\s*\((Low|Medium|High|XHigh|Max)\)$")
+
+
+def agy_base_models():
+    """Return deduplicated base models [{id, label}] from `agy models`."""
+    seen = {}
+    for m in agy_models():
+        base_id = _EFFORT_SUFFIX_RE.sub("", m["id"])
+        base_label = _EFFORT_LABEL_RE.sub("", m["label"])
+        if base_id not in seen:
+            seen[base_id] = {"id": base_id, "label": base_label}
+    return list(seen.values())
+
+
+def _resolve_agy_model(model, effort):
+    """Map a base model + effort (e.g. gemini-4-hydrogen + high) to an exact `agy models` id."""
+    if not model:
+        return None
+    raw = [m["id"] for m in agy_models()]
+    if model in raw:
+        return model
+    if effort and f"{model}-{effort}" in raw:
+        return f"{model}-{effort}"
+    for fallback in ("medium", "high", "low", "xhigh", "max"):
+        if f"{model}-{fallback}" in raw:
+            return f"{model}-{fallback}"
+    return model
+
+
 def find(planner):
     """Path of the planner's command-line tool, or None."""
-    return shutil.which({"claude-code": "claude", "codex": "codex"}.get(planner, ""))
+    return shutil.which({"claude-code": "claude", "codex": "codex", "agy": "agy"}.get(planner, ""))
 
 
 def default_planner(have_key):
     """An account login when its tool is installed, else the API key."""
-    for p in ("claude-code", "codex"):
+    for p in ("claude-code", "codex", "agy"):
         if find(p):
             return p
     return "api" if have_key else "claude-code"
@@ -130,8 +188,8 @@ def split_reply(text):
 class Planner:
     """One conversation with Claude Code or Codex, run non-interactively in the workspace."""
 
-    def __init__(self, planner, cwd, model=None, session=None, solo=False, allow_shell=False):
-        self.planner, self.cwd, self.model = planner, cwd, model
+    def __init__(self, planner, cwd, model=None, effort=None, session=None, solo=False, allow_shell=False):
+        self.planner, self.cwd, self.model, self.effort = planner, cwd, model, effort
         self.solo = solo                # the tool does the work itself instead of handing it to the local model
         self.allow_shell = allow_shell  # solo: it may also run shell commands
         self.session = session   # the tool's own session id, to continue the conversation
@@ -144,7 +202,7 @@ class Planner:
     def _run(self, args, prompt, should_stop):
         exe = find(self.planner)
         if not exe:
-            name = "Claude Code" if self.planner == "claude-code" else "Codex"
+            name = {"claude-code": "Claude Code", "codex": "Codex", "agy": "Antigravity"}.get(self.planner, self.planner)
             raise RuntimeError(f"{name} is not installed or not on PATH; install it and sign in, or choose another "
                                "planner")
         # the point is the account login: a key in the environment would make the tool bill the API instead
@@ -152,7 +210,8 @@ class Planner:
         self.proc = subprocess.Popen([exe, *args], cwd=self.cwd, env=env, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            self.proc.stdin.write(prompt.encode("utf-8"))
+            if prompt is not None:
+                self.proc.stdin.write(prompt.encode("utf-8"))
             self.proc.stdin.close()
             # the pipes are drained by helpers so a long reply cannot block the tool
             chunks, errs = [], []
@@ -184,6 +243,8 @@ class Planner:
                 args += ["--resume", self.session]
             if self.model:
                 args += ["--model", self.model]
+            if self.effort:
+                args += ["--effort", self.effort]
             code, text, err = self._run(args, prompt, should_stop)
             data = None
             for line in reversed(text.strip().splitlines()):
@@ -209,6 +270,8 @@ class Planner:
             args += ["-c", 'sandbox_mode="workspace-write"']
             if self.model:
                 args += ["-m", self.model]
+            if self.effort:
+                args += ["-c", f'model_reasoning_effort="{self.effort}"']
             code, text, err = self._run(args, prompt, should_stop)
             reply, failure = [], ""
             for line in text.splitlines():
@@ -226,6 +289,34 @@ class Planner:
                 raise RuntimeError("Codex gave no reply: " + (failure or err.strip()[-400:] or f"exit code {code}")
                                    + " (run `codex login` in a terminal to sign in, if that is the problem)")
             return reply[-1]
+        if self.planner == "agy":
+            if not self.session:
+                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell)) + "\n\n# The user's request\n\n" + prompt
+            args = ["--output-format", "json", "--mode", "accept-edits"]
+            if self.allow_shell:
+                args.append("--dangerously-skip-permissions")
+            if self.session:
+                args += ["--conversation", self.session]
+            resolved_model = _resolve_agy_model(self.model, self.effort)
+            if resolved_model:
+                args += ["--model", resolved_model]
+            if self.effort:
+                args += ["--effort", self.effort]
+            args.append(f"--print={prompt}")
+            code, text, err = self._run(args, None, should_stop)
+            data = None
+            for line in reversed(text.strip().splitlines()):
+                try:
+                    data = json.loads(line)
+                    break
+                except ValueError:
+                    continue
+            if not isinstance(data, dict):
+                raise RuntimeError("Antigravity gave no reply" + (": " + (err or text).strip()[-400:] if err or text else ""))
+            self.session = data.get("conversation_id") or self.session
+            if data.get("status") != "SUCCESS" and not data.get("response"):
+                raise RuntimeError("Antigravity: " + str(data.get("error") or data.get("status") or "error")[:400])
+            return str(data.get("response") or "")
         raise RuntimeError(f"unknown planner {self.planner}")
 
 
