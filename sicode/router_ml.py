@@ -13,7 +13,6 @@ PROVIDER_COST = {
     "claude-code": 0.008,
     "codex": 0.008,
     "agy": 0.005,
-    "gemini": 0.004,
     "codebuddy": 0.004,
     "tcloud": 0.004,
     "api": 0.015,
@@ -65,13 +64,13 @@ class RuntimeRouterML:
     def _prior(provider, effort, x, quota_left, tok_rate):
         _, _, is_code, is_design, is_multi, has_img, has_vid, _ = x
         score = 0.55 + 0.25 * (max(0.0, min(100.0, quota_left)) / 100.0)
-        if has_vid > 0.5 and provider in ("gemini", "agy"):
+        if has_vid > 0.5 and provider == "agy":
             score += 0.35
-        elif has_img > 0.5 and provider in ("agy", "gemini", "claude-code", "codex", "api"):
+        elif has_img > 0.5 and provider in ("agy", "claude-code", "codex", "api"):
             score += 0.15
         if is_code > 0.5 and provider in ("codex", "claude-code", "codebuddy"):
             score += 0.12
-        if is_design > 0.5 and provider in ("agy", "gemini", "claude-code"):
+        if is_design > 0.5 and provider in ("agy", "claude-code"):
             score += 0.12
         cost_w = PROVIDER_COST.get(provider, 0.008) * EFFORT_MULT.get(effort, 1.0)
         score -= cost_w * (4.0 if is_multi < 0.5 else 2.0)

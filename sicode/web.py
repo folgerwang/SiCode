@@ -858,7 +858,7 @@ class Web:
                                 session=t.sessions.get(key), solo=solo, allow_shell=self.mode == "auto",
                                 providers_info=p_info, cloud_ratio=c_ratio, images=imgs)
         self.planner_chat = chat
-        who = {"claude-code": "claude", "codex": "codex", "agy": "agy", "gemini": "gemini",
+        who = {"claude-code": "claude", "codex": "codex", "agy": "agy",
                "codebuddy": "codebuddy", "tcloud": "tcloud"}.get(p, p)
         note = [None]
         snap = [None]

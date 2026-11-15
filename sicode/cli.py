@@ -53,7 +53,7 @@ HELP = f"""{BOLD}Requests{OFF}
   /mode [name]     permission mode: ask, edits, auto
   /model [name]    Claude model for [c]: opus, sonnet, haiku, fable or a full model id
   /local [number]  the local model: lists the installed ones, or switches to one
-  /planner [name]  who plans [c] requests: api, claude-code, codex, agy, gemini, codebuddy, tcloud
+  /planner [name]  who plans [c] requests: api, claude-code, codex, agy, codebuddy, tcloud
   /providers       show activated cloud providers & account usage; /providers enable|disable <id> | auto
   /cloud [0-100]   cloud AI share for this project (0=local, 100=cloud only & unload local, default 10)
   /paste           attach image or video from clipboard (or press Alt+V while typing)

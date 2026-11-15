@@ -22,7 +22,6 @@ PLANNERS = {
     "claude-code": "Claude account (through Claude Code)",
     "codex": "ChatGPT account (through Codex)",
     "agy": "Google account (through Antigravity)",
-    "gemini": "Google account (through Gemini CLI)",
     "codebuddy": "Tencent CodeBuddy CLI",
     "tcloud": "Tencent Cloud AI CLI",
 }
@@ -31,7 +30,6 @@ PLANNER_BINS = {
     "claude-code": "claude",
     "codex": "codex",
     "agy": "agy",
-    "gemini": "gemini",
     "codebuddy": "codebuddy",
     "tcloud": "tcloud",
 }
@@ -257,7 +255,6 @@ def detect_account_usage():
         "claude-code": _count_jsonl_timestamps(os.path.join(home, ".claude", "history.jsonl"), "timestamp", 1000.0, now),
         "codex": _count_jsonl_timestamps(os.path.join(home, ".codex", "history.jsonl"), "ts", 1.0, now),
         "agy": _count_recent_dirs(os.path.join(home, ".gemini", "antigravity-cli", "brain"), now),
-        "gemini": _count_recent_dirs(os.path.join(home, ".gemini", "tmp"), now),
         "codebuddy": _count_recent_dirs(os.path.join(home, ".codebuddy"), now),
         "tcloud": _count_recent_dirs(os.path.join(home, ".tcloud"), now),
     }
@@ -294,16 +291,16 @@ def pick_task_planner(task_text, enabled_map, usage_map, have_key, media=None):
         used = int(u.get("used", 0))
         affinity = 0.0
         if has_video:
-            if k in ("gemini", "agy"):
+            if k == "agy":
                 affinity += 25.0
             elif k in ("claude-code", "api", "codex"):
                 affinity += 5.0
         elif has_image:
-            if k in ("agy", "gemini", "claude-code", "codex", "api"):
+            if k in ("agy", "claude-code", "codex", "api"):
                 affinity += 10.0
         if is_code and k in ("codex", "claude-code", "codebuddy"):
             affinity += 5.0
-        elif is_design and k in ("agy", "gemini", "claude-code"):
+        elif is_design and k in ("agy", "claude-code"):
             affinity += 5.0
         # Usage left dominates; affinity breaks ties and steers media to capable models.
         return (-(quota + affinity), used, order.index(k))
@@ -313,7 +310,7 @@ def pick_task_planner(task_text, enabled_map, usage_map, have_key, media=None):
 
 def default_planner(have_key):
     """An account login when its tool is installed, else the API key."""
-    for p in ("claude-code", "codex", "agy", "gemini", "codebuddy", "tcloud"):
+    for p in ("claude-code", "codex", "agy", "codebuddy", "tcloud"):
         if find(p):
             return p
     return "api" if have_key else "claude-code"
@@ -504,31 +501,6 @@ class Planner:
             if data.get("status") != "SUCCESS" and not data.get("response"):
                 raise RuntimeError("Antigravity: " + str(data.get("error") or data.get("status") or "error")[:400])
             return str(data.get("response") or "")
-        if self.planner == "gemini":
-            if not self.session and not self.raw:
-                prompt = self._system_prompt(self.allow_shell) + "\n\n# The user's request\n\n" + prompt
-            args = ["-p", prompt, "-o", "json", "--approval-mode", "yolo" if self.allow_shell else "auto_edit"]
-            if self.session:
-                args += ["--resume", self.session]
-            if self.model:
-                args += ["-m", self.model]
-            code, text, err = self._run(args, None, should_stop)
-            data = None
-            for line in reversed(text.strip().splitlines()):
-                try:
-                    data = json.loads(line)
-                    break
-                except ValueError:
-                    continue
-            if isinstance(data, dict):
-                self.session = data.get("session_id") or self.session
-                if data.get("error"):
-                    raise RuntimeError("Gemini CLI: " + str(data["error"])[:400])
-                if data.get("response") is not None:
-                    return str(data["response"])
-            if text.strip():
-                return text.strip()
-            raise RuntimeError("Gemini CLI gave no reply" + (": " + err.strip()[-400:] if err.strip() else f" (exit code {code})"))
         if self.planner in ("codebuddy", "tcloud"):
             if not self.session and not self.raw:
                 prompt = self._system_prompt(self.allow_shell) + "\n\n# The user's request\n\n" + prompt

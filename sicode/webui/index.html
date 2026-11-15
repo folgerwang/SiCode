@@ -158,6 +158,8 @@ dialog::backdrop { background: rgba(20, 15, 5, .45); }
 dialog .dh { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
 dialog .dh h3 { flex: 1; font-size: 15.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 dialog .db { padding: 14px 16px; overflow: auto; max-height: calc(86vh - 110px); }
+#setdlg { width: min(1040px, 95vw); max-height: 92vh; }
+#setdlg .db { max-height: calc(92vh - 102px); }
 dialog .df { padding: 10px 16px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; }
 dialog pre { margin: 0; font: 12.5px/1.5 var(--mono); white-space: pre; }
 dialog label { display: block; font-size: 12.5px; color: var(--dim); margin: 12px 0 4px; }
@@ -346,7 +348,7 @@ function view(it) {
     w.append(b);
   } else if (it.type === 'assistant') {
     const a = el('div', 'assistant');
-    if (it.who && it.who !== 'local') a.append(el('div', 'who', {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[it.who] || 'Claude'));
+    if (it.who && it.who !== 'local') a.append(el('div', 'who', {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[it.who] || 'Claude'));
     const body = el('div', 'md'); body.innerHTML = md(it.text || '');
     a.append(body); w.append(a);
   } else if (it.type === 'think') {
@@ -507,7 +509,7 @@ function renderBar() {
   const ratio = curTask ? ((st.project_cloud_ratio || {})[curTask.workspace] ?? 10) : 10;
   route = ratio <= 0 ? 'local' : ratio >= 100 ? 'cloud' : 'hybrid';
   const plId = (route === 'hybrid' && st.mix_auto && st.primary_planner) ? st.primary_planner : st.planner;
-  const brand = {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[plId] || 'Claude';
+  const brand = {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[plId] || 'Claude';
   const mine = isBusy(cur), b = $('send');
   b.textContent = mine ? 'Stop' : 'Send'; b.className = mine ? '' : 'primary'; b.disabled = !cur;
   $('forcestop').hidden = !mine;
@@ -796,7 +798,7 @@ function plannerNote() {
     return;
   }
   const p = st.planners.find(x => x.id === $('planner').value);
-  const name = {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini CLI', codebuddy: 'CodeBuddy', tcloud: 'Tencent Cloud AI'}[p.id] || 'Claude Code';
+  const name = {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'Tencent Cloud AI'}[p.id] || 'Claude Code';
   $('plannernote').textContent = p.id === 'api' ? 'Uses the key below; billed per token by Anthropic.'
     : p.found ? 'Uses the account you are signed in with in ' + name + '; no API key is involved. It can read the folder, and hands every change to the local model.'
     : name + ' was not found on this computer. Install it and sign in first.';
@@ -810,7 +812,6 @@ const PROVIDER_MODELS = {
   codex: [['', 'Default (codex)'], ['gpt-5.4', 'GPT-5.4'], ['gpt-5.3-codex', 'GPT-5.3 Codex'],
           ['gpt-5.2-codex', 'GPT-5.2 Codex'], ['gpt-5.1-codex-max', 'GPT-5.1 Codex Max'],
           ['o3', 'o3'], ['o4-mini', 'o4-mini']],
-  gemini: [['', 'Default (gemini)'], ['gemini-2.5-pro', 'Gemini 2.5 Pro'], ['gemini-2.5-flash', 'Gemini 2.5 Flash']],
   codebuddy: [['', 'Default (codebuddy)']],
   tcloud: [['', 'Default (tcloud)']]
 };
@@ -819,7 +820,6 @@ const PROVIDER_EFFORTS = {
   'claude-code': ['', 'low', 'medium', 'high', 'xhigh', 'max'],
   codex: ['', 'low', 'medium', 'high', 'xhigh'],
   agy: ['', 'low', 'medium', 'high', 'xhigh', 'max'],
-  gemini: ['', 'low', 'medium', 'high'],
   codebuddy: ['', 'low', 'medium', 'high'],
   tcloud: ['', 'low', 'medium', 'high']
 };
