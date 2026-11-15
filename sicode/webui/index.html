@@ -195,6 +195,9 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
           <button data-r="cloud" id="cloudbtn">Claude</button>
         </div>
         <select id="mode" title="Permissions"></select>
+        <div id="alloc" title="Project task allocation: left = more Local, right = more Cloud" style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);margin-left:4px">
+          <span>Local</span><input type="range" id="cloudmix" min="0" max="100" step="5" value="50" style="width:84px;accent-color:var(--accent)"><span>Cloud</span><b id="cloudmixv" style="color:var(--text);min-width:32px">50%</b>
+        </div>
         <span class="sp"></span>
         <button id="restart" title="Force stop if running and re-run the last request" hidden>Restart</button>
         <button id="forcestop" class="danger" title="Force stop the stuck task and reset the worker" hidden>Force Stop</button>
@@ -219,8 +222,11 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
   <div id="recent"></div>
   <label>In this folder</label><div id="dirs" style="max-height:38vh;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:4px"></div></div><div class="df"><span class="dim" id="direrr" style="flex:1;font-size:12.5px;align-self:center"></span><button class="primary" id="usedir">Start a task here</button></div></dialog>
 <dialog id="setdlg"><div class="dh"><h3>Settings</h3><button class="ghost" data-close>Close</button></div><div class="db">
-  <label for="planner">The cloud model, for the Mix and cloud modes</label><select id="planner"></select>
+  <label for="planner">Primary cloud model (or auto-selected by most usage left in Mix mode)</label><select id="planner"></select>
   <div class="dim" id="plannernote" style="font-size:12.5px;margin-top:6px"></div>
+  <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text)"><input type="checkbox" id="mixauto" style="width:auto"> Mix mode: auto-select primary provider with most usage left &amp; mix activated models/thinking levels</label>
+  <label>Installed cloud AI CLI providers (activated when found locally; toggle to use or skip, and set usage left %)</label>
+  <div id="providerlist" style="display:flex;flex-direction:column;gap:6px;border:1px solid var(--line);border-radius:8px;padding:8px"></div>
   <label for="localmodel">Local model</label><select id="localmodel"></select>
   <div class="dim" id="localnote" style="font-size:12.5px;margin-top:6px"></div>
   <label for="vramcap">Most VRAM in use on the card, in GB, counting other programs (0 = no cap)</label><input type="text" id="vramcap" inputmode="decimal" autocomplete="off">
@@ -481,8 +487,9 @@ function renderBar() {
   const m = $('mode');
   if (!m.options.length) for (const k of Object.keys(st.modes)) m.append(new Option({ask: 'Ask before changes', edits: 'Ask before commands', auto: 'Never ask'}[k] || k, k));
   m.value = st.mode; m.title = st.modes[st.mode];
-  const pl = st.planners.find(x => x.id === st.planner) || st.planners[0];
-  const brand = {codex: 'Codex', agy: 'Antigravity'}[st.planner] || 'Claude';
+  const plId = (route === 'hybrid' && st.mix_auto && st.primary_planner) ? st.primary_planner : st.planner;
+  const pl = st.planners.find(x => x.id === plId) || st.planners[0];
+  const brand = {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini', opencode: 'OpenCode', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[plId] || 'Claude';
   $('cloudbtn').textContent = brand;
   $('cloudbtn').title = brand + ' does the work itself (' + pl.label + '). The local model is not used.' +
     (st.planner === 'api' ? '' : ' Its file changes are applied directly and shown afterwards; Undo puts them back.');
@@ -492,6 +499,9 @@ function renderBar() {
   $('forcestop').hidden = !st.busy;
   const hasUser = items.some(it => it && it.type === 'user');
   $('restart').hidden = !(mine || (cur && hasUser && !st.busy));
+  const curTask = st.tasks.find(x => x.id === cur);
+  const ratio = curTask ? ((st.project_cloud_ratio || {})[curTask.workspace] ?? 50) : 50;
+  $('cloudmix').value = ratio; $('cloudmixv').textContent = ratio + '%';
   updateTimers();
   $('undo').disabled = !undoN || !!st.busy; $('compact').disabled = !!st.busy || st.ctx_task !== cur;
   const c = $('context'); c.textContent = '';
@@ -632,6 +642,12 @@ function connect() {
 // --- wiring ---
 $('new').onclick = () => chooseFolder();  // a new task starts with choosing its folder
 $('send').onclick = send;
+$('cloudmix').oninput = () => { $('cloudmixv').textContent = $('cloudmix').value + '%'; };
+$('cloudmix').onchange = async () => {
+  const curTask = st && st.tasks.find(x => x.id === cur);
+  if (!curTask) return;
+  await api('/api/project-mix', {workspace: curTask.workspace, ratio: parseInt($('cloudmix').value, 10)});
+};
 $('forcestop').onclick = async () => { await api('/api/force-stop', {}); };
 $('restart').onclick = async () => {
   const r = await api('/api/restart', {task: cur});
@@ -647,7 +663,7 @@ $('compact').onclick = () => api('/api/send', {task: cur, text: '/compact', rout
 $('fileview').onclick = e => { const b = e.target.closest('button'); if (b) showFile(b.dataset.v); };
 document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => b.closest('dialog').close());
 function plannerNote() { const p = st.planners.find(x => x.id === $('planner').value);
-  const name = {codex: 'Codex', agy: 'Antigravity'}[p.id] || 'Claude Code';
+  const name = {codex: 'Codex', agy: 'Antigravity', gemini: 'Gemini CLI', opencode: 'OpenCode', codebuddy: 'CodeBuddy', tcloud: 'Tencent Cloud AI'}[p.id] || 'Claude Code';
   $('plannernote').textContent = p.id === 'api' ? 'Uses the key below; billed per token by Anthropic.'
     : p.found ? 'Uses the account you are signed in with in ' + name + '; no API key is involved. It can read the folder, and hands every change to the local model.'
     : name + ' was not found on this computer. Install it and sign in first.'; }
@@ -659,17 +675,26 @@ const PROVIDER_MODELS = {
                   ['claude-haiku-5-5', 'Claude Haiku 5.5']],
   codex: [['', 'Default (codex)'], ['gpt-5.4', 'GPT-5.4'], ['gpt-5.3-codex', 'GPT-5.3 Codex'],
           ['gpt-5.2-codex', 'GPT-5.2 Codex'], ['gpt-5.1-codex-max', 'GPT-5.1 Codex Max'],
-          ['o3', 'o3'], ['o4-mini', 'o4-mini']]
+          ['o3', 'o3'], ['o4-mini', 'o4-mini']],
+  gemini: [['', 'Default (gemini)'], ['gemini-2.5-pro', 'Gemini 2.5 Pro'], ['gemini-2.5-flash', 'Gemini 2.5 Flash']],
+  opencode: [['', 'Default (opencode)']],
+  codebuddy: [['', 'Default (codebuddy)']],
+  tcloud: [['', 'Default (tcloud)']]
 };
 const PROVIDER_EFFORTS = {
   api: ['low', 'medium', 'high', 'xhigh', 'max'],
   'claude-code': ['', 'low', 'medium', 'high', 'xhigh', 'max'],
   codex: ['', 'low', 'medium', 'high', 'xhigh'],
-  agy: ['', 'low', 'medium', 'high', 'xhigh', 'max']
+  agy: ['', 'low', 'medium', 'high', 'xhigh', 'max'],
+  gemini: ['', 'low', 'medium', 'high'],
+  opencode: ['', 'low', 'medium', 'high'],
+  codebuddy: ['', 'low', 'medium', 'high'],
+  tcloud: ['', 'low', 'medium', 'high']
 };
 function fillCloudModels() {
   const p = $('planner').value, m = $('model'), ef = $('effort');
-  const brand = {api: 'Claude API', 'claude-code': 'Claude Code', codex: 'Codex', agy: 'Antigravity'}[p] || p;
+  const brand = {api: 'Claude API', 'claude-code': 'Claude Code', codex: 'Codex', agy: 'Antigravity',
+                 gemini: 'Gemini CLI', opencode: 'OpenCode', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[p] || p;
   $('modellbl').textContent = brand + ' model';
   $('effortlbl').textContent = brand + ' reasoning effort';
   m.textContent = '';
@@ -692,7 +717,24 @@ function fillCloudModels() {
 }
 $('planner').onchange = () => { plannerNote(); fillCloudModels(); };
 $('settings').onclick = () => { const ps = $('planner'); ps.textContent = '';
-  for (const p of st.planners) ps.append(new Option(p.label + (p.found ? '' : ' (not installed)'), p.id)); ps.value = st.planner; plannerNote(); fillCloudModels();
+  for (const p of st.planners) ps.append(new Option(p.label + (p.installed ? '' : ' (not installed)'), p.id)); ps.value = st.planner; plannerNote(); fillCloudModels();
+  $('mixauto').checked = st.mix_auto !== false;
+  const plBox = $('providerlist'); plBox.textContent = '';
+  for (const p of st.planners) {
+    const row = el('div'); row.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12.5px';
+    const cb = Object.assign(el('input'), {type: 'checkbox', checked: !!p.enabled, disabled: !p.installed});
+    cb.style.width = 'auto'; cb.dataset.pid = p.id;
+    const lbl = el('span', '', p.label); lbl.style.flex = '1';
+    const badge = el('span', 's ' + (p.installed ? (p.enabled ? 'ok' : 'wait') : 'bad'),
+      !p.installed ? 'not installed' : p.id === st.primary_planner ? 'activated · primary' : (p.enabled ? 'activated' : 'disabled'));
+    const q = Object.assign(el('input'), {type: 'number', min: '0', max: '100', step: '5',
+      value: (p.usage && p.usage.quota_left != null) ? p.usage.quota_left : 100});
+    q.style.cssText = 'width:62px;padding:3px 6px;border:1px solid var(--line);border-radius:6px;background:var(--bg)';
+    q.title = 'Usage left (%)'; q.dataset.qid = p.id;
+    const used = el('span', 'dim', '% left (' + ((p.usage && p.usage.used) || 0) + ' used)');
+    row.append(cb, lbl, badge, q, used);
+    plBox.append(row);
+  }
   const lm = $('localmodel'); lm.textContent = '';
   for (const m of st.local_models) lm.append(new Option(m.label + (m.default ? ' (default)' : ''), m.path));
   lm.value = st.local_model; if (lm.value !== st.local_model) { lm.append(new Option(st.local_model, st.local_model)); lm.value = st.local_model; }
@@ -706,6 +748,10 @@ $('settings').onclick = () => { const ps = $('planner'); ps.textContent = '';
 $('saveset').onclick = async () => { if ($('key').value.trim()) await api('/api/key', {key: $('key').value.trim()}); if ($('localmodel').value !== st.local_model) { const r = await api('/api/localmodel', {path: $('localmodel').value}); if (r.error) { alert(r.error); return; } }
   const cap = parseFloat($('vramcap').value); if (!isNaN(cap) && cap !== (st.vram_cap || 0)) await api('/api/vramcap', {gb: cap});
   const wd = parseFloat($('watchdog').value); if (!isNaN(wd) && wd !== (st.watchdog_minutes ?? 10)) await api('/api/watchdog', {minutes: wd});
+  const enabled = {}, quota = {};
+  for (const cb of document.querySelectorAll('#providerlist input[data-pid]')) enabled[cb.dataset.pid] = cb.checked;
+  for (const q of document.querySelectorAll('#providerlist input[data-qid]')) quota[q.dataset.qid] = parseFloat(q.value);
+  await api('/api/planners', {enabled, quota, mix_auto: $('mixauto').checked});
   await api('/api/planner', {planner: $('planner').value});
   await api('/api/model', {planner: $('planner').value, model: $('model').value, effort: $('effort').value});
   $('setdlg').close(); };

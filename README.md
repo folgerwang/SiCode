@@ -1,4 +1,4 @@
-# qwen3-local-test
+# SiCode
 
 ![SiCode in the browser: a Mix-mode task, with steps marked [l] for the local model and [c] for Claude](docs/sicode-mix.png)
 
@@ -15,8 +15,8 @@ Qwen3.8-Flash-Next; `[m]` (mix) has Claude or Codex split the job between itself
 Claude or Codex do it alone. The cloud model signs in with your Claude or ChatGPT account (through Claude Code or
 Codex) or with a Claude API key.
 
-**Download:** [sicode-0.2.1-py3-none-win_amd64.whl](https://github.com/folgerwang/qwen3-local-test/releases/download/sicode-v0.2.1/sicode-0.2.1-py3-none-win_amd64.whl)
-([all releases](https://github.com/folgerwang/qwen3-local-test/releases))
+**Download:** [sicode-0.2.1-py3-none-win_amd64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.1/sicode-0.2.1-py3-none-win_amd64.whl)
+([all releases](https://github.com/folgerwang/SiCode/releases))
 
 ```
 pip install sicode-0.2.1-py3-none-win_amd64.whl

@@ -22,6 +22,20 @@ PLANNERS = {
     "claude-code": "Claude account (through Claude Code)",
     "codex": "ChatGPT account (through Codex)",
     "agy": "Google account (through Antigravity)",
+    "gemini": "Google account (through Gemini CLI)",
+    "opencode": "OpenCode CLI",
+    "codebuddy": "Tencent CodeBuddy CLI",
+    "tcloud": "Tencent Cloud AI CLI",
+}
+
+PLANNER_BINS = {
+    "claude-code": "claude",
+    "codex": "codex",
+    "agy": "agy",
+    "gemini": "gemini",
+    "opencode": "opencode",
+    "codebuddy": "codebuddy",
+    "tcloud": "tcloud",
 }
 
 SPLIT = """Two of you do the work, and every step of the job goes to one of you:
@@ -43,14 +57,38 @@ PLAN_FORMAT = """one step per line, each starting with its state and who does it
 States: [ ] to do, [~] in progress, [x] done."""
 
 
-def hybrid_prompt(can_run):
-    """The system prompt for Claude Code or Codex in the hybrid mode."""
+def hybrid_prompt(can_run, providers_info="", cloud_ratio=50):
+    """The system prompt for the primary cloud planner in the hybrid (Mix) mode."""
     run = ("You can also run shell commands yourself." if can_run else
            "You cannot run shell commands yourself: builds, tests and other commands are always [l] steps.")
+    r = max(0, min(100, int(cloud_ratio)))
+    if r <= 15:
+        bias = f"Project allocation setting: {100 - r}% Local / {r}% Cloud. Strongly prefer [l]: delegate almost all edits, implementation, and tests to the local model; reserve [c] only for planning and final review."
+    elif r <= 40:
+        bias = f"Project allocation setting: {100 - r}% Local / {r}% Cloud. Prefer [l]: delegate most coding and verification to the local model, keeping only complex design or tricky bugs as [c]."
+    elif r <= 60:
+        bias = f"Project allocation setting: {100 - r}% Local / {r}% Cloud. Balanced split between [l] and [c]."
+    elif r <= 85:
+        bias = f"Project allocation setting: {100 - r}% Local / {r}% Cloud. Prefer [c]: handle most design and implementation in the cloud, delegating only routine commands or bulk boilerplate to [l]."
+    else:
+        bias = f"Project allocation setting: {100 - r}% Local / {r}% Cloud. Strongly prefer [c]: do almost all work directly in the cloud (and other activated cloud providers), using [l] only if strictly needed."
+    extra_cloud = ""
+    if providers_info:
+        extra_cloud = f"""
+
+Other activated cloud providers (ranked by usage left) are also available for specialized steps:
+{providers_info}
+To hand a step to another cloud provider (with an optional model or thinking effort: low, medium, high, xhigh), use:
+<delegate provider="codex" effort="high">
+The complete brief for that provider.
+</delegate>
+Use <delegate> (without provider) for the free local model [l]."""
     return f"""You are the lead engineer in SiCode, a coding assistant. The user works in a repository (your working \
 directory) and talks to you.
 
 {SPLIT}
+
+{bias}{extra_cloud}
 
 For a job with more than one step, start with the plan and send it again, complete, whenever a state changes:
 
@@ -85,7 +123,8 @@ request asks for and no others, and check your work when you have a way to. If y
 which checks are still to be run. Keep the final reply short: what you did or found, what you ran and its result, \
 and anything unfinished."""
 
-DELEGATE_RE = re.compile(r"<delegate>\s*(.*?)\s*</delegate>", re.S)
+DELEGATE_RE = re.compile(r"<delegate([^>]*)>\s*(.*?)\s*</delegate>", re.S)
+ATTR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
 PLAN_RE = re.compile(r"<plan>\s*(.*?)\s*</plan>", re.S)
 STEP_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:\[([ xX~])\]\s*)?(?:\[([lLcC])\]\s*)?(.*\S)\s*$")
 MAX_HANDOFFS = 12
@@ -150,12 +189,33 @@ def _resolve_agy_model(model, effort):
 
 def find(planner):
     """Path of the planner's command-line tool, or None."""
-    return shutil.which({"claude-code": "claude", "codex": "codex", "agy": "agy"}.get(planner, ""))
+    return shutil.which(PLANNER_BINS.get(planner, ""))
+
+
+def available_planners(have_key):
+    """Return list of planner ids that are currently installed/configured."""
+    return [k for k in PLANNERS if (k == "api" and have_key) or bool(find(k))]
+
+
+def pick_primary_planner(enabled_map, usage_map, have_key):
+    """Pick the enabled, installed planner with the most usage left (highest quota_left, fewest used calls)."""
+    avail = [k for k in available_planners(have_key) if enabled_map.get(k, True)]
+    if not avail:
+        avail = available_planners(have_key)
+    if not avail:
+        return "claude-code"
+    order = list(PLANNERS.keys())
+    def score(k):
+        u = (usage_map or {}).get(k) or {}
+        quota = float(u.get("quota_left", 100.0))
+        used = int(u.get("used", 0))
+        return (-quota, used, order.index(k))
+    return min(avail, key=score)
 
 
 def default_planner(have_key):
     """An account login when its tool is installed, else the API key."""
-    for p in ("claude-code", "codex", "agy"):
+    for p in ("claude-code", "codex", "agy", "gemini", "opencode", "codebuddy", "tcloud"):
         if find(p):
             return p
     return "api" if have_key else "claude-code"
@@ -174,25 +234,35 @@ def parse_plan(text):
     return steps
 
 
-def split_reply(text):
-    """(text shown to the user, task for the worker or None, plan text or None)."""
+def split_reply_meta(text):
+    """(text shown to the user, task for the worker or None, plan text or None, delegate attrs dict)."""
     plan = PLAN_RE.search(text)
     if plan:
         text = text[:plan.start()] + text[plan.end():]
     m = DELEGATE_RE.search(text)
     if not m:
-        return text.strip(), None, plan.group(1) if plan else None
-    return text[:m.start()].strip(), m.group(1).strip(), plan.group(1) if plan else None
+        return text.strip(), None, plan.group(1) if plan else None, {}
+    attrs = {k.lower(): v for k, v in ATTR_RE.findall(m.group(1) or "")}
+    return text[:m.start()].strip(), m.group(2).strip(), plan.group(1) if plan else None, attrs
+
+
+def split_reply(text):
+    """(text shown to the user, task for the worker or None, plan text or None)."""
+    shown, task, plan, _ = split_reply_meta(text)
+    return shown, task, plan
 
 
 class Planner:
-    """One conversation with Claude Code or Codex, run non-interactively in the workspace."""
+    """One conversation with a cloud CLI tool, run non-interactively in the workspace."""
 
-    def __init__(self, planner, cwd, model=None, effort=None, session=None, solo=False, allow_shell=False, raw=False):
+    def __init__(self, planner, cwd, model=None, effort=None, session=None, solo=False, allow_shell=False, raw=False,
+                 providers_info="", cloud_ratio=50):
         self.planner, self.cwd, self.model, self.effort = planner, cwd, model, effort
         self.solo = solo                # the tool does the work itself instead of handing it to the local model
         self.allow_shell = allow_shell  # solo: it may also run shell commands
         self.raw = raw                  # single-turn non-coding prompt (e.g. watchdog check)
+        self.providers_info = providers_info
+        self.cloud_ratio = cloud_ratio
         self.session = session   # the tool's own session id, to continue the conversation
         self.proc = None
 
@@ -208,7 +278,7 @@ class Planner:
     def _run(self, args, prompt, should_stop):
         exe = find(self.planner)
         if not exe:
-            name = {"claude-code": "Claude Code", "codex": "Codex", "agy": "Antigravity"}.get(self.planner, self.planner)
+            name = PLANNERS.get(self.planner, self.planner)
             raise RuntimeError(f"{name} is not installed or not on PATH; install it and sign in, or choose another "
                                "planner")
         # the point is the account login: a key in the environment would make the tool bill the API instead
@@ -245,7 +315,7 @@ class Planner:
             else:
                 tools = "Read,Grep,Glob,Edit,Write" + (",Bash" if self.allow_shell else "")
                 args = ["-p", "--output-format", "json", "--tools", tools, "--permission-mode", "acceptEdits",
-                        "--append-system-prompt", SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell)]
+                        "--append-system-prompt", SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)]
                 if self.allow_shell:
                     args += ["--allowedTools", "Bash"]
             if self.session:
@@ -275,7 +345,7 @@ class Planner:
             else:
                 args = ["exec", "--json", "--skip-git-repo-check", "-"]
                 if not self.raw:
-                    prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(True)) + "\n\n# The user's request\n\n" + prompt
+                    prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(True, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
             # Codex edits and runs commands inside its own sandbox, limited to the workspace
             args += ["-c", 'sandbox_mode="workspace-write"']
             if self.model:
@@ -301,7 +371,7 @@ class Planner:
             return reply[-1]
         if self.planner == "agy":
             if not self.session and not self.raw:
-                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell)) + "\n\n# The user's request\n\n" + prompt
+                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
             args = ["--output-format", "json", "--mode", "accept-edits"]
             if self.allow_shell:
                 args.append("--dangerously-skip-permissions")
@@ -327,11 +397,94 @@ class Planner:
             if data.get("status") != "SUCCESS" and not data.get("response"):
                 raise RuntimeError("Antigravity: " + str(data.get("error") or data.get("status") or "error")[:400])
             return str(data.get("response") or "")
+        if self.planner == "gemini":
+            if not self.session and not self.raw:
+                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
+            args = ["-p", prompt, "-o", "json", "--approval-mode", "yolo" if self.allow_shell else "auto_edit"]
+            if self.session:
+                args += ["--resume", self.session]
+            if self.model:
+                args += ["-m", self.model]
+            code, text, err = self._run(args, None, should_stop)
+            data = None
+            for line in reversed(text.strip().splitlines()):
+                try:
+                    data = json.loads(line)
+                    break
+                except ValueError:
+                    continue
+            if isinstance(data, dict):
+                self.session = data.get("session_id") or self.session
+                if data.get("error"):
+                    raise RuntimeError("Gemini CLI: " + str(data["error"])[:400])
+                if data.get("response") is not None:
+                    return str(data["response"])
+            if text.strip():
+                return text.strip()
+            raise RuntimeError("Gemini CLI gave no reply" + (": " + err.strip()[-400:] if err.strip() else f" (exit code {code})"))
+        if self.planner == "opencode":
+            if not self.session and not self.raw:
+                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
+            args = ["run", "--format", "json"]
+            if self.session:
+                args += ["-s", self.session]
+            if self.model:
+                args += ["-m", self.model]
+            args.append(prompt)
+            code, text, err = self._run(args, None, should_stop)
+            parts = []
+            for line in text.splitlines():
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict):
+                    self.session = ev.get("sessionID") or ev.get("session_id") or self.session
+                    p = ev.get("part") or {}
+                    if isinstance(p, dict) and p.get("type") == "text" and p.get("text"):
+                        parts.append(p["text"])
+                    elif ev.get("type") == "text" and ev.get("text"):
+                        parts.append(ev["text"])
+            if parts:
+                return "\n".join(parts)
+            if text.strip():
+                return text.strip()
+            raise RuntimeError("OpenCode gave no reply" + (": " + err.strip()[-400:] if err.strip() else f" (exit code {code})"))
+        if self.planner in ("codebuddy", "tcloud"):
+            if not self.session and not self.raw:
+                prompt = (SOLO_PROMPT if self.solo else hybrid_prompt(self.allow_shell, self.providers_info, self.cloud_ratio)) + "\n\n# The user's request\n\n" + prompt
+            if self.planner == "codebuddy":
+                args = ["-p", "--output-format", "json"]
+                if self.session:
+                    args += ["--resume", self.session]
+                if self.model:
+                    args += ["--model", self.model]
+                code, text, err = self._run(args, prompt, should_stop)
+            else:
+                args = ["ai", "chat", "--prompt", prompt, "--output", "json"]
+                if self.model:
+                    args += ["--model", self.model]
+                code, text, err = self._run(args, None, should_stop)
+            data = None
+            for line in reversed(text.strip().splitlines()):
+                try:
+                    data = json.loads(line)
+                    break
+                except ValueError:
+                    continue
+            if isinstance(data, dict):
+                self.session = data.get("session_id") or self.session
+                for k in ("result", "response", "text", "content", "output"):
+                    if data.get(k):
+                        return str(data[k])
+            if text.strip():
+                return text.strip()
+            raise RuntimeError(f"{PLANNERS[self.planner]} gave no reply" + (": " + err.strip()[-400:] if err.strip() else f" (exit code {code})"))
         raise RuntimeError(f"unknown planner {self.planner}")
 
 
 def run(planner, text, delegate, show, should_stop=lambda: False, on_plan=lambda steps: None,
-        before_turn=lambda: None, after_turn=lambda: None):
+        before_turn=lambda: None, after_turn=lambda: None, delegate_cloud=None):
     """One user request. The tool's replies go to `show`, its plan to `on_plan(steps)`, its [l] tasks to
     `delegate(task) -> report`. before_turn / after_turn bracket every run of the tool, which may edit files."""
     def ask(prompt):
@@ -346,13 +499,18 @@ def run(planner, text, delegate, show, should_stop=lambda: False, on_plan=lambda
         show(reply.strip() or "[no reply]")
         return
     for _ in range(MAX_HANDOFFS):
-        shown, task, plan = split_reply(reply)
+        shown, task, plan, meta = split_reply_meta(reply)
         if plan:
             on_plan(parse_plan(plan))
         if shown:
             show(shown)
         if task is None:
             return
-        report = delegate(task)
-        reply = ask("The worker has finished the [l] task.\n\n" + report)
+        prov = (meta.get("provider") or "").strip().lower()
+        if prov and prov != "local" and delegate_cloud is not None:
+            report = delegate_cloud(task, meta)
+            reply = ask(f"Provider {prov} has finished the delegated task.\n\n" + report)
+        else:
+            report = delegate(task)
+            reply = ask("The worker has finished the [l] task.\n\n" + report)
     show("[stopped: more hand-offs than SiCode allows in one request]")

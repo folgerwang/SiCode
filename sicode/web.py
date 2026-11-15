@@ -166,8 +166,20 @@ class Web:
         self.sub = False          # inside a delegated task
         self.by = ""              # hybrid: who is acting now, "c" (the cloud model) or "l" (the local model)
         cfg = load_config()
+        self.enabled_planners = dict(cfg.get("enabled_planners") or {})
+        for k in planners.PLANNERS:
+            if k not in self.enabled_planners:
+                self.enabled_planners[k] = (k == "api" and have_credentials()) or bool(planners.find(k))
+        self.planner_usage = {}
+        raw_usage = cfg.get("planner_usage") or {}
+        for k in planners.PLANNERS:
+            u = raw_usage.get(k) or {}
+            self.planner_usage[k] = {"used": int(u.get("used", 0)), "quota_left": float(u.get("quota_left", 100.0))}
+        self.mix_auto = bool(cfg.get("mix_auto", True))
+        self.project_cloud_ratio = {os.path.realpath(k): max(0, min(100, int(v)))
+                                    for k, v in (cfg.get("project_cloud_ratio") or {}).items()}
         self.planner = a.planner if a.planner != "auto" else cfg.get("planner") or \
-            planners.default_planner(have_credentials())
+            planners.pick_primary_planner(self.enabled_planners, self.planner_usage, have_credentials())
         self.planner_models = dict(cfg.get("planner_models") or {})
         if cfg.get("agy_model") and "agy" not in self.planner_models:
             self.planner_models["agy"] = cfg["agy_model"]
@@ -198,13 +210,20 @@ class Web:
 
     def state(self):
         e = self.engine
+        avail = set(planners.available_planners(have_credentials()))
+        primary = planners.pick_primary_planner(self.enabled_planners, self.planner_usage, have_credentials())
         return {"version": __version__, "mode": self.mode, "modes": MODES, "model": self.a.model, "effort": self.a.effort,
                 "busy": self.busy, "key": have_credentials(), "planner": self.planner, "vram_cap": vram_cap(self.a),
                 "watchdog_minutes": self.watchdog_minutes,
+                "mix_auto": self.mix_auto, "primary_planner": primary,
+                "project_cloud_ratio": self.project_cloud_ratio,
+                "enabled_planners": self.enabled_planners, "planner_usage": self.planner_usage,
                 "local_model": self.a.worker_model, "local_models": local_models(),
                 "planner_models": self.planner_models, "planner_efforts": self.planner_efforts,
                 "agy_models": planners.agy_base_models(),
-                "planners": [{"id": k, "label": v, "found": k == "api" or bool(planners.find(k))}
+                "planners": [{"id": k, "label": v, "found": k == "api" or (k in avail),
+                              "installed": k in avail, "enabled": bool(self.enabled_planners.get(k, False)),
+                              "usage": self.planner_usage.get(k, {"used": 0, "quota_left": 100.0})}
                              for k, v in planners.PLANNERS.items()], "default_workspace": os.path.realpath(self.a.dir),
                 "engine": bool(e), "ctx": e.ctx if e else 0,
                 "ctx_used": e.ctx_used if e and self.local_open else 0, "ctx_task": self.engine_task,
@@ -631,17 +650,94 @@ class Web:
             del t.messages[mark:]
             self.add(type="error", text="Could not reach the Claude API (network).")
 
-    def login_turn(self, text, solo=False):
-        """Claude Code or Codex, signed in with the user's account: hybrid, or working alone (cloud)."""
+    def _record_planner_usage(self, planner_id):
+        u = self.planner_usage.setdefault(planner_id, {"used": 0, "quota_left": 100.0})
+        u["used"] = int(u.get("used", 0)) + 1
+        try:
+            save_config(planner_usage=self.planner_usage)
+        except OSError:
+            pass
+        self.push_state()
+
+    def _active_planner(self, route):
+        if route == "hybrid" and self.mix_auto:
+            return planners.pick_primary_planner(self.enabled_planners, self.planner_usage, have_credentials())
+        return self.planner
+
+    def _providers_summary(self, primary):
+        avail = set(planners.available_planners(have_credentials()))
+        lines = []
+        for k, label in planners.PLANNERS.items():
+            if k == primary or k not in avail or not self.enabled_planners.get(k, False):
+                continue
+            m = self.planner_models.get(k) or (self.a.model if k == "api" else "default")
+            ef = self.planner_efforts.get(k) or (self.a.effort if k == "api" else "default")
+            q = self.planner_usage.get(k, {}).get("quota_left", 100.0)
+            lines.append(f'- "{k}" ({label}): model={m}, effort={ef}, usage_left={q:.0f}%')
+        return "\n".join(lines)
+
+    def delegate_cloud(self, task_text, meta):
+        prov = (meta.get("provider") or "").strip().lower()
+        avail = set(planners.available_planners(have_credentials()))
+        if prov not in avail or not self.enabled_planners.get(prov, False):
+            return self.delegate(task_text)
+        model = meta.get("model") or self.planner_models.get(prov) or None
+        effort = meta.get("effort") or self.planner_efforts.get(prov) or None
+        item = self.add(type="delegate", task=f"[{prov}" + (f":{effort}" if effort else "") + f"] {task_text}", status="running")
+        self.sub = True
+        snap = self.ws.snapshot()
+        try:
+            if prov == "api":
+                if self.anthropic is None:
+                    self.anthropic = load_anthropic()
+                if self.client is None:
+                    self.client = self.anthropic.Anthropic()
+                msg = self.client.messages.create(
+                    model=model or self.a.model, max_tokens=2048,
+                    messages=[{"role": "user", "content": task_text}],
+                )
+                reply = "".join(b.text for b in msg.content if b.type == "text")
+            else:
+                chat = planners.Planner(
+                    prov, self.task.workspace, model=model, effort=effort,
+                    solo=True, allow_shell=self.mode == "auto",
+                )
+                self.planner_chat = chat
+                try:
+                    reply = chat.ask(task_text, lambda: self.stop)
+                finally:
+                    self.planner_chat = None
+            self._record_planner_usage(prov)
+            for path, old, new in self.ws.changes_since(snap):
+                lines, added, removed, more = diff_lines(old, new if new is not None else "")
+                self.add(type="diff", path=path, new_file=old is None, deleted=new is None, added=added,
+                         removed=removed, lines=lines, more=more, status="applied")
+                self.task.changed.setdefault(path, old)
+                self.send({"op": "changed", "task": self.task.id, "files": sorted(self.task.changed)})
+            self.update(item, status="done")
+            return reply or "(no reply)"
+        except Exception as e:
+            self.update(item, status="error")
+            return f"error from {prov}: {e}"
+        finally:
+            self.sub = False
+
+    def login_turn(self, text, solo=False, planner_id=None):
+        """Cloud CLI planner: hybrid (Mix) or working alone (cloud)."""
+        p = planner_id or self.planner
         t = self.task
-        label = planners.PLANNERS[self.planner]
-        key = self.planner + (":solo" if solo else "")
-        chat = planners.Planner(self.planner, t.workspace,
-                                model=self.planner_models.get(self.planner) or None,
-                                effort=self.planner_efforts.get(self.planner) or None,
-                                session=t.sessions.get(key), solo=solo, allow_shell=self.mode == "auto")
+        label = planners.PLANNERS[p]
+        key = p + (":solo" if solo else "")
+        p_info = "" if solo else self._providers_summary(p)
+        c_ratio = self.project_cloud_ratio.get(os.path.realpath(t.workspace), 50)
+        chat = planners.Planner(p, t.workspace,
+                                model=self.planner_models.get(p) or None,
+                                effort=self.planner_efforts.get(p) or None,
+                                session=t.sessions.get(key), solo=solo, allow_shell=self.mode == "auto",
+                                providers_info=p_info, cloud_ratio=c_ratio)
         self.planner_chat = chat
-        who = {"claude-code": "claude", "codex": "codex", "agy": "agy"}.get(self.planner, "claude")
+        who = {"claude-code": "claude", "codex": "codex", "agy": "agy", "gemini": "gemini",
+               "opencode": "opencode", "codebuddy": "codebuddy", "tcloud": "tcloud"}.get(p, p)
         note = [None]
         snap = [None]
 
@@ -652,6 +748,7 @@ class Web:
             note[0] = self.add(type="note", text=f"{label} is {verb} ...", status="running")
 
         def after_turn():
+            self._record_planner_usage(p)
             if note[0] is not None:
                 self.update(note[0], status="done", text=f"{label}")
                 note[0] = None
@@ -664,7 +761,8 @@ class Web:
 
         try:
             planners.run(chat, text, self.delegate, lambda reply: self.add(type="assistant", who=who, text=reply),
-                         lambda: self.stop, on_plan=self.show_plan, before_turn=before_turn, after_turn=after_turn)
+                         lambda: self.stop, on_plan=self.show_plan, before_turn=before_turn, after_turn=after_turn,
+                         delegate_cloud=self.delegate_cloud)
         finally:
             if chat.session:
                 t.sessions[key] = chat.session
@@ -707,9 +805,11 @@ class Web:
             if task.title == "New task":
                 task.title = text.strip().splitlines()[0][:70]
             self.push_state()
-            if route in ("hybrid", "cloud") and self.planner != "api":
-                self.login_turn(self.attach(text), solo=route == "cloud")
+            active_p = self._active_planner(route)
+            if route in ("hybrid", "cloud") and active_p != "api":
+                self.login_turn(self.attach(text), solo=route == "cloud", planner_id=active_p)
             elif route in ("hybrid", "cloud"):
+                self._record_planner_usage("api")
                 self.claude_turn(self.attach(text), solo=route == "cloud")
             else:
                 self.local_turn(self.attach(text), prior)
@@ -873,6 +973,42 @@ class Web:
                 pass
             self.push_state()
             return {"watchdog_minutes": self.watchdog_minutes}
+        if path == "/api/planners":
+            if "enabled" in body and isinstance(body["enabled"], dict):
+                for k, v in body["enabled"].items():
+                    if k in planners.PLANNERS:
+                        self.enabled_planners[k] = bool(v)
+            if "quota" in body and isinstance(body["quota"], dict):
+                for k, v in body["quota"].items():
+                    if k in planners.PLANNERS:
+                        try:
+                            q = max(0.0, min(100.0, float(v)))
+                            self.planner_usage.setdefault(k, {"used": 0, "quota_left": 100.0})["quota_left"] = q
+                        except (TypeError, ValueError):
+                            pass
+            if "mix_auto" in body:
+                self.mix_auto = bool(body["mix_auto"])
+            try:
+                save_config(enabled_planners=self.enabled_planners, planner_usage=self.planner_usage,
+                            mix_auto=self.mix_auto)
+            except OSError:
+                pass
+            self.push_state()
+            return {"enabled_planners": self.enabled_planners, "planner_usage": self.planner_usage,
+                    "mix_auto": self.mix_auto}
+        if path == "/api/project-mix":
+            ws = os.path.realpath(body.get("workspace") or self.a.dir)
+            try:
+                ratio = max(0, min(100, int(body.get("ratio", 50))))
+            except (TypeError, ValueError):
+                return {"error": "invalid ratio"}
+            self.project_cloud_ratio[ws] = ratio
+            try:
+                save_config(project_cloud_ratio=self.project_cloud_ratio)
+            except OSError:
+                pass
+            self.push_state()
+            return {"workspace": ws, "ratio": ratio}
         if path == "/api/model":
             p = body.get("planner")
             if p in planners.PLANNERS and p != "api":

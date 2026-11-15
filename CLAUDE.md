@@ -86,7 +86,7 @@ the code: priorities, measured facts, dead ends and working rules.
   model as the reference.
 - Bash heredocs turn `\\n` inside C++ string literals into real newlines. Write patch scripts with the Write tool
   or use Edit.
-- Commit and push only when asked. `main` is the working branch on GitHub (`folgerwang/qwen3-local-test`).
+- Commit and push only when asked. `main` is the working branch on GitHub (`folgerwang/SiCode`).
 
 ## State on 2026-11-13
 
