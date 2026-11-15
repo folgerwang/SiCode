@@ -148,8 +148,9 @@ details.think div { white-space: pre-wrap; border-left: 2px solid var(--line); p
 #info .kids { margin-left: 14px; }
 .meter { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: 6px 0; }
 .meter i { display: block; height: 100%; background: var(--accent); transition: width .25s ease; }
-.kv { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--dim); gap: 8px; }
-.kv b { color: var(--text); font-weight: 500; text-align: right; }
+.kv { display: flex; justify-content: space-between; align-items: baseline; font-size: 12.5px; color: var(--dim); gap: 8px; }
+.kv span { white-space: nowrap; flex-shrink: 0; }
+.kv b { color: var(--text); font-weight: 500; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 
 /* dialogs */
 dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--text); padding: 0; width: min(860px, 92vw); max-height: 86vh; box-shadow: 0 12px 40px rgba(0, 0, 0, .3); }
@@ -546,9 +547,16 @@ function renderBar() {
   c.append(kv('Cloud model', (st.mix_auto !== false ? 'ML Auto · ' : '') + pLabel));
   const enabledCloud = (st.planners || []).filter(p => p.installed && p.enabled);
   if (enabledCloud.length) {
-    const hdr = el('div', 'kv'); hdr.style.marginTop = '6px';
-    hdr.append(el('span', '', 'Cloud usage'), el('b', '', enabledCloud.length + ' active'));
-    c.append(hdr);
+    const hdr = el('div', 'kv'); hdr.style.cssText = 'margin-top:6px;cursor:pointer;user-select:none';
+    const titleSpan = el('span', '', (window._cloudUsageOpen ? '▾ ' : '▸ ') + 'Cloud usage');
+    hdr.append(titleSpan, el('b', '', enabledCloud.length + ' active'));
+    const listBox = el('div'); listBox.hidden = !window._cloudUsageOpen;
+    hdr.onclick = () => {
+      window._cloudUsageOpen = !window._cloudUsageOpen;
+      listBox.hidden = !window._cloudUsageOpen;
+      titleSpan.textContent = (window._cloudUsageOpen ? '▾ ' : '▸ ') + 'Cloud usage';
+    };
+    c.append(hdr, listBox);
     for (const p of enabledCloud) {
       const u = p.usage || {};
       const q = u.quota_left != null ? Math.round(u.quota_left) : 100;
@@ -556,25 +564,32 @@ function renderBar() {
       const detail = q + '% left' + (u5 || u24 ? ' · ' + u5 + '/5h · ' + u24 + '/24h' : (uSi ? ' · ' + uSi + ' runs' : ''));
       const row = kv('· ' + p.label, detail);
       row.style.paddingLeft = '6px';
-      c.append(row);
+      listBox.append(row);
     }
   }
   const projModels = curTask && st.project_models ? (st.project_models[curTask.workspace] || []) : [];
   if (projModels.length) {
-    const mHdr = el('div', 'kv'); mHdr.style.marginTop = '6px';
-    mHdr.append(el('span', '', 'Models used (project)'), el('b', '', projModels.length + ''));
-    c.append(mHdr);
+    const mHdr = el('div', 'kv'); mHdr.style.cssText = 'margin-top:6px;cursor:pointer;user-select:none';
+    const mTitle = el('span', '', (window._projModelsOpen ? '▾ ' : '▸ ') + 'Models used (project)');
+    mHdr.append(mTitle, el('b', '', projModels.length + ''));
+    const mList = el('div'); mList.hidden = !window._projModelsOpen;
+    mHdr.onclick = () => {
+      window._projModelsOpen = !window._projModelsOpen;
+      mList.hidden = !window._projModelsOpen;
+      mTitle.textContent = (window._projModelsOpen ? '▾ ' : '▸ ') + 'Models used (project)';
+    };
+    c.append(mHdr, mList);
     for (const m of projModels) {
       const parts = [m.runs + 'x'];
       if (m.tokens) parts.push(m.tokens.toLocaleString() + ' tok');
       if (m.cost) parts.push('$' + m.cost.toFixed(4));
       const row = kv('· ' + m.model, parts.join(' · '));
       row.style.paddingLeft = '6px';
-      c.append(row);
+      mList.append(row);
     }
   }
 }
-function kv(k, v) { const d = el('div', 'kv'); d.append(el('span', '', k), el('b', '', v)); return d; }
+function kv(k, v) { const d = el('div', 'kv'); const b = el('b', '', v); b.title = v; d.append(el('span', '', k), b); return d; }
 function renderChanged() {
   const c = $('changed'); c.textContent = ''; c.className = changed.length ? '' : 'dim';
   if (!changed.length) c.textContent = 'Nothing changed in this task.';
