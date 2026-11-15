@@ -23,24 +23,44 @@ Codex) or with a Claude API key.
 | **Linux (x86_64)** | [sicode-0.2.2-py3-none-manylinux_2_28_x86_64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.2/sicode-0.2.2-py3-none-manylinux_2_28_x86_64.whl) | `pip install sicode-0.2.2-py3-none-manylinux_2_28_x86_64.whl` |
 | **macOS (Apple Silicon)** | [sicode-0.2.2-py3-none-macosx_11_0_arm64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.2/sicode-0.2.2-py3-none-macosx_11_0_arm64.whl) | `pip install sicode-0.2.2-py3-none-macosx_11_0_arm64.whl` |
 
-```
-pip install sicode-0.2.2-py3-none-win_amd64.whl
-sicode --download-model        # once: the local model, about 115 GB, to ~/.sicode/models
+### CLI Installation Guide (Windows / Linux / macOS)
+
+Requires **Python 3.10+** (if `sicode` is not on `PATH` after `pip install`, run `python -m sicode` or `python3 -m sicode`).
+
+**Windows (x64, PowerShell / CMD):**
+```powershell
+pip install https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.2/sicode-0.2.2-py3-none-win_amd64.whl
+sicode --download-model        # optional: local model (~115 GB) to ~/.sicode/models
 cd your-project
-sicode                         # in the terminal
-sicode --web                   # as a page in the browser (the screenshot above)
+sicode                         # terminal CLI (Alt+V pastes clipboard image/video)
+sicode --web                   # browser UI
+```
+> Note: Windows also needs the Microsoft Visual C++ runtime (and Vulkan 1.3 GPU driver for GPU acceleration, or use `--backend cpu`).
+
+**Linux (x86_64):**
+```bash
+python3 -m pip install --user https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.2/sicode-0.2.2-py3-none-manylinux_2_28_x86_64.whl
+export PATH="$HOME/.local/bin:$PATH"
+sicode --download-model
+cd your-project
+sicode                         # terminal CLI (Alt+V pastes image/video; uses xclip/wl-paste)
+sicode --web                   # browser UI
+```
+
+**macOS (Apple Silicon arm64):**
+```bash
+python3 -m pip install --user https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.2/sicode-0.2.2-py3-none-macosx_11_0_arm64.whl
+export PATH="$HOME/Library/Python/$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')/bin:$PATH"
+sicode --download-model
+cd your-project
+sicode                         # terminal CLI (Alt+V pastes clipboard image/video)
+sicode --web                   # browser UI
 ```
 
 ![Installing SiCode and listing its command-line options in cmd](docs/sicode-cmd.png)
 
 `sicode --web` opens the same assistant as a page in the browser: tasks, live progress, approvals and the files it
-changed.
-
-The wheel holds the assistant and a prebuilt engine (`qwen.exe`) for 64-bit Windows; nothing has to be compiled. It
-needs Python 3.10 or later, a CPU with AVX-512, a GPU with a Vulkan 1.3 driver (`--backend cpu` runs without one,
-slowly) and the Microsoft Visual C++ runtime. If `sicode` is not found after installing, pip put it in a folder that
-is not on PATH; `python -m sicode` does the same. From a checkout of this repository, `pip install -e .` uses the
-engine and the model from the Setup section below. Details: [sicode/README.md](sicode/README.md).
+changed. From a checkout of this repository, `pip install -e .` uses the engine and the model from the Setup section below. Details: [sicode/README.md](sicode/README.md).
 
 ## Setup
 
