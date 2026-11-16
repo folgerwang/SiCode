@@ -69,10 +69,6 @@ A playable browser-based 3D MOBA arena built in TypeScript/Vite using SiCode's M
 
 ![SiCode Settings with dynamic ML cloud selection and aligned provider table](docs/sicode-settings.png)
 
-**Working Environment — Multi-Project, Combined Usage & Live Progress:**
-
-![SiCode Web UI working environment](docs/sicode-webui.jpg)
-
 ![Installing SiCode and listing its command-line options in cmd](docs/sicode-cmd.png)
 
 `sicode --web` opens the same assistant as a page in the browser: tasks, live progress, approvals and the files it
