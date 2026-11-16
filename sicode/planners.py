@@ -154,7 +154,9 @@ def agy_models():
         _AGY_MODELS_CACHE = []
         return _AGY_MODELS_CACHE
     try:
-        out = subprocess.check_output([exe, "models"], stderr=subprocess.DEVNULL, timeout=5).decode("utf-8", errors="replace")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        out = subprocess.check_output([exe, "models"], stderr=subprocess.DEVNULL, timeout=5,
+                                      creationflags=flags).decode("utf-8", errors="replace")
         models = []
         for line in out.splitlines():
             if "\t" in line:
@@ -379,8 +381,9 @@ class Planner:
                                "planner")
         # the point is the account login: a key in the environment would make the tool bill the API instead
         env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         self.proc = subprocess.Popen([exe, *args], cwd=self.cwd, env=env, stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags)
         try:
             if prompt is not None:
                 self.proc.stdin.write(prompt.encode("utf-8"))

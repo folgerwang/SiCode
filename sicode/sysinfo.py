@@ -81,8 +81,9 @@ def vram():
             return m.used, m.total
         return None
     try:  # no NVML library: ask nvidia-smi
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=5).stdout.split("\n")[0].split(",")
+                             capture_output=True, text=True, timeout=5, creationflags=flags).stdout.split("\n")[0].split(",")
         return int(out[0]) << 20, int(out[1]) << 20
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
         return None

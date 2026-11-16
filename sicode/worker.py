@@ -193,7 +193,7 @@ class Engine:
         self.stop_path = os.path.join(tmp, f"sicode-stop-{os.getpid()}")  # its existence interrupts generation
         self.log = open(self.log_path, "w", encoding="utf-8", errors="replace")
         # its own process group: Ctrl+C in the console interrupts the assistant, not the loaded model
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        flags = (subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0
         env = dict(os.environ)
         self.vram_limit_mb = None
         if vram_cap_gb and vram_cap_gb > 0:

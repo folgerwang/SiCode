@@ -255,7 +255,9 @@ class Workspace:
         with tempfile.TemporaryFile(mode="w+b") as out_file:
             kw = {"shell": True, "cwd": self.root, "stdin": subprocess.DEVNULL,
                   "stdout": out_file, "stderr": subprocess.STDOUT}
-            if os.name != "nt":
+            if os.name == "nt":
+                kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            else:
                 kw["start_new_session"] = True
             proc = subprocess.Popen(command, **kw)
             self._active_proc = proc

@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SiCode Vulkan Compute Shader &amp; Shared Memory Architecture</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #171a23; --card2: #1e222e; --line: #2d3345;
+    --text: #e6e9f2; --dim: #9aa3b8; --accent: #5b9cf6; --green: #3ecf8e;
+    --amber: #f5a623; --purple: #a78bfa; --rose: #f472b6;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+  header { padding: 20px 28px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 16px; align-items: center; justify-content: space-between; }
+  header h1 { margin: 0; font-size: 20px; font-weight: 600; }
+  header p { margin: 4px 0 0; color: var(--dim); font-size: 13px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--dim); }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: middle; }
+  main { padding: 22px 28px 40px; max-width: 1460px; margin: 0 auto; }
+  .graph-wrap { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; overflow-x: auto; }
+  svg { display: block; width: 100%; min-width: 1180px; height: auto; }
+  .node rect { rx: 8; ry: 8; stroke-width: 1.5; transition: filter .15s; cursor: pointer; }
+  .node:hover rect { filter: brightness(1.18); }
+  .node text { fill: var(--text); font-family: system-ui, sans-serif; pointer-events: none; }
+  .node .t { font-size: 12.5px; font-weight: 600; }
+  .node .s { font-size: 10.5px; fill: var(--dim); font-family: ui-monospace, Consolas, monospace; }
+  .edge { fill: none; stroke: #4b5572; stroke-width: 1.6; marker-end: url(#arr); }
+  .edge.opt { stroke: var(--green); stroke-dasharray: 5 3; marker-end: url(#arr-g); }
+  .edge-lbl { fill: var(--dim); font-size: 10.5px; font-family: ui-monospace, Consolas, monospace; }
+  .tip { margin-top: 12px; padding: 12px 14px; background: var(--card2); border: 1px solid var(--line); border-radius: 8px; font-size: 13px; min-height: 46px; }
+  .tip b { color: var(--accent); }
+  h2 { font-size: 16px; margin: 26px 0 10px; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; font-size: 13px; }
+  th, td { padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { background: var(--card2); color: var(--dim); font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; }
+  tr:last-child td { border-bottom: none; }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; background: rgba(255,255,255,.06); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>SiCode Vulkan Compute Shader &amp; Shared Memory Architecture</h1>
+    <p>Data flow from Global VRAM (BDA) → L2/L1 → Shared Memory &amp; Register Pipelining → SIMT / CoopMat / Subgroup → Output VRAM (click any node for ISA &amp; SMEM details)</p>
+  </div>
+  <div class="legend">
+    <span><i class="dot" style="background:#5b9cf6"></i>Host / Dispatch</span>
+    <span><i class="dot" style="background:#3ecf8e"></i>SMEM / Cache Optimization</span>
+    <span><i class="dot" style="background:#a78bfa"></i>Compute (FFMA / HMMA / SHFL)</span>
+    <span><i class="dot" style="background:#f5a623"></i>VRAM / Global I/O</span>
+  </div>
+</header>
+
+<main>
+  <div class="graph-wrap">
+    <svg viewBox="0 0 1280 760" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 1 L 10 5 L 0 9 z" fill="#4b5572"/>
+        </marker>
+        <marker id="arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 1 L 10 5 L 0 9 z" fill="#3ecf8e"/>
+        </marker>
+      </defs>
+
+      <!-- Global VRAM Inputs -->
+      <g class="node" data-info="<b>Global VRAM Inputs (BDA uint64_t)</b>: Quantized weights (Q4_K / Q5_K / Q8_0 / FP8), activations X (FP32), and MoE expert routing table (base, start, count). Accessed via buffer_reference 64-bit pointers (LDG.E.128).">
+        <rect x="20" y="25" width="240" height="72" fill="#231f16" stroke="#f5a623"/>
+        <text x="34" y="50" class="t">Global VRAM (BDA Pointers)</text>
+        <text x="34" y="70" class="s">W (Q4_K/Q5_K/Q8/FP8) + X + Table</text>
+        <text x="34" y="85" class="s">LDG.E.128 / L2 + L1TEX Cache</text>
+      </g>
+
+      <!-- Host Dispatch -->
+      <g class="node" data-info="<b>Host Dispatcher (qwen4_vk.cpp / vk_backend.cpp)</b>: Selects pipeline by batch size n and CoopMat support. Optimization: use 128-thread WG (4 warps) or Split-K when gx * gy &lt; num_SMs so narrow projections and n=16..64 don't leave SMs idle.">
+        <rect x="330" y="25" width="320" height="72" fill="#162133" stroke="#5b9cf6"/>
+        <text x="344" y="50" class="t">Host Dispatch (qwen4_vk / vk_backend)</text>
+        <text x="344" y="70" class="s">Pick tier by n, CoopMat, &amp; SM saturation</text>
+        <text x="344" y="85" class="s">Adaptive 4-warp / Split-K if gx*gy &lt; num_SMs</text>
+      </g>
+
+      <path d="M 260 61 L 330 61" class="edge"/>
+
+      <!-- Column 1: Decode / Small Batch -->
+      <g class="node" data-info="<b>Tier 1: Decode / MTP Small-Batch (q4_matmul / matmul_fp8)</b>: Grid (ceil(rows/8), ceil(n/NT), 1), 256 threads = 8 subgroups × 32 lanes. Each subgroup owns 1 output row.">
+        <rect x="20" y="150" width="285" height="68" fill="#162133" stroke="#5b9cf6"/>
+        <text x="34" y="175" class="t">Tier 1: Decode (n &lt;= 8)</text>
+        <text x="34" y="194" class="s">q4_matmul / matmul_fp8 (NT &lt;= 8)</text>
+        <text x="34" y="209" class="s">8 subgroups/WG, 1 row/subgroup</text>
+      </g>
+      <g class="node" data-info="<b>SMEM Activation Cache for Decode (Optimization)</b>: Currently q4_matmul reads X[t] directly from global/L1 in every subgroup (8x redundant). Staging X tile into shared vec4 Xs[] shares X across all 8 rows in the workgroup when NT &gt;= 2.">
+        <rect x="20" y="250" width="285" height="72" fill="#142922" stroke="#3ecf8e"/>
+        <text x="34" y="275" class="t">SMEM X Cache (NT &gt;= 2 / MTP)</text>
+        <text x="34" y="294" class="s">shared vec4 Xs[...] reused 8x</text>
+        <text x="34" y="309" class="s">Coalesced decode8(W) -&gt; regs (a0..a3)</text>
+      </g>
+      <g class="node" data-info="<b>Subgroup Dot &amp; Warp Reduction</b>: Lanes stride K by 32 (FFMA acc1[NT], acc2[NT]). Final reduction uses subgroupAdd() -&gt; SHFL.BFLY + FADD (zero SMEM needed for reduction).">
+        <rect x="20" y="355" width="285" height="72" fill="#211a33" stroke="#a78bfa"/>
+        <text x="34" y="380" class="t">Subgroup Dot + SHFL.BFLY</text>
+        <text x="34" y="399" class="s">dot(a0..3, x0..3) -&gt; subgroupAdd()</text>
+        <text x="34" y="414" class="s">Fused SWIGLU / silu epilogue</text>
+      </g>
+
+      <!-- Column 2: Prefill SIMT GEMM -->
+      <g class="node" data-info="<b>Tier 2: Prefill SIMT GEMM (q4_gemm / gemm_fp8)</b>: Grid (ceil(rows/64), ceil(n/64), 1), 256 threads (16×16). Each thread computes a 4×4 FP32 register tile (acc[4] + acc2[4]).">
+        <rect x="340" y="150" width="300" height="68" fill="#162133" stroke="#5b9cf6"/>
+        <text x="354" y="175" class="t">Tier 2: Prefill SIMT (n &gt; 8)</text>
+        <text x="354" y="194" class="s">q4_gemm / gemm_fp8 (64x64 tile)</text>
+        <text x="354" y="209" class="s">16x16 threads, 4x4 FP32 acc/thread</text>
+      </g>
+      <g class="node" data-info="<b>Coalesced Staging + Bank-Free SMEM (Optimization)</b>: Stage raw Q4_K/Q5_K/Q8_0 blocks coalesced in SMEM, dequantize into bank-padded Ws[32][17], Ws2[32][17], Xs[32][17] (+1 vec4 pad eliminates STS bank conflicts).">
+        <rect x="340" y="250" width="300" height="72" fill="#142922" stroke="#3ecf8e"/>
+        <text x="354" y="275" class="t">Coalesced Stage + Padded SMEM</text>
+        <text x="354" y="294" class="s">Ws[32][17], Ws2[32][17], Xs[32][17]</text>
+        <text x="354" y="309" class="s">+1 vec4 pad -&gt; zero STS/LDS conflicts</text>
+      </g>
+      <g class="node" data-info="<b>Register Double-Buffering + Outer-Product FFMA (Optimization)</b>: Issue LDG for k0+BK into registers BEFORE the 32x outer-product FFMA loop from SMEM, hiding DRAM/L2 latency across BAR.SYNC without 2x SMEM.">
+        <rect x="340" y="355" width="300" height="72" fill="#211a33" stroke="#a78bfa"/>
+        <text x="354" y="380" class="t">Reg Double-Buffer + FFMA Loop</text>
+        <text x="354" y="399" class="s">Overlap LDG(k0+BK) with 32x FFMA(k0)</text>
+        <text x="354" y="414" class="s">acc[i] += a[i] * b; fused SWIGLU</text>
+      </g>
+
+      <!-- Column 3: Prefill CoopMat -->
+      <g class="node" data-info="<b>Tier 3: Tensor-Core GEMM (gemm_coop)</b>: Uses VK_KHR_cooperative_matrix (16×16×16 HMMA). 8 subgroups arranged 4×2, each holding two 16×16 MatC accumulators. Already uses LDA = BK + 8 bank padding.">
+        <rect x="675" y="150" width="295" height="68" fill="#162133" stroke="#5b9cf6"/>
+        <text x="689" y="175" class="t">Tier 3: CoopMat Tensor Core</text>
+        <text x="689" y="194" class="s">gemm_coop (HMMA 16x16x16)</text>
+        <text x="689" y="209" class="s">FP8-&gt;FP16 W; hi+lo FP16 X; LDA=BK+8</text>
+      </g>
+      <g class="node" data-info="<b>SMEM Aliasing for 2x SM Occupancy (Optimization)</b>: Currently Ws, Ws2, Xs, Xl, and Cs are all allocated together (~37 KB/WG -&gt; 1 WG/SM on 48-64 KB SMs). Aliasing Cs over Ws/Xs after the K-loop drops SMEM below 24 KB, doubling WG/SM occupancy.">
+        <rect x="675" y="250" width="295" height="72" fill="#142922" stroke="#3ecf8e"/>
+        <text x="689" y="275" class="t">SMEM Aliasing (2x Occupancy)</text>
+        <text x="689" y="294" class="s">Reuse Ws/Xs memory for Cs epilogue</text>
+        <text x="689" y="309" class="s">~37 KB -&gt; &lt;24 KB (2+ WG/SM)</text>
+      </g>
+      <g class="node" data-info="<b>CoopMat MMA + Block Scale Epilogue</b>: coopMatLoad -&gt; coopMatMulAdd (hi + lo passes) -&gt; per-128-K block scale -&gt; coopMatStore to aliased Cs -&gt; fused SWIGLU &amp; global store.">
+        <rect x="675" y="355" width="295" height="72" fill="#211a33" stroke="#a78bfa"/>
+        <text x="689" y="380" class="t">coopMatMulAdd + Epilogue</text>
+        <text x="689" y="399" class="s">16x16x16 f16-&gt;f32 + block scale</text>
+        <text x="689" y="414" class="s">Fused SWIGLU via aliased Cs</text>
+      </g>
+
+      <!-- Column 4: Attention & Aux -->
+      <g class="node" data-info="<b>Tier 4: Attention &amp; MoE Aux (attention / deltanet / moe_route)</b>: Attention splits KV length across gz splits. Bank-padding sacc[8][D+4] eliminates bank conflicts during final head reduction.">
+        <rect x="1005" y="150" width="255" height="172" fill="#162133" stroke="#5b9cf6"/>
+        <text x="1019" y="180" class="t">Tier 4: Attention &amp; Aux</text>
+        <text x="1019" y="204" class="s">attention: (n, n_heads, splits)</text>
+        <text x="1019" y="224" class="s">Pad sacc[8][D+4] in SMEM</text>
+        <text x="1019" y="248" class="s">attn_combine / deltanet</text>
+        <text x="1019" y="268" class="s">moe_route / moe_group</text>
+        <text x="1019" y="288" class="s">add_rmsnorm / qk_norm_rope</text>
+      </g>
+
+      <!-- Epilogue & Output VRAM -->
+      <g class="node" data-info="<b>Global VRAM Output Buffer Y</b>: Written directly from registers (Decode lane 0 STG.E.32; SIMT 4×4 STG; CoopMat aliased Cs -&gt; STG). Split-K adds a lightweight reduction pass only when gx * gy &lt; num_SMs.">
+        <rect x="340" y="510" width="590" height="78" fill="#231f16" stroke="#f5a623"/>
+        <text x="356" y="538" class="t">Output Buffer Y in Global VRAM (Fused Epilogue, Zero Extra Round-Trips)</text>
+        <text x="356" y="558" class="s">Decode: lane 0 STG.E.32  |  SIMT: 4x4 STG per thread  |  Coop: aliased Cs -&gt; STG</text>
+        <text x="356" y="574" class="s">(Optional Split-K reduce only when grid &lt; num_SMs)</text>
+      </g>
+
+      <!-- Summary Box -->
+      <g class="node" data-info="<b>Core Utilization Summary</b>: Standard Vulkan compute compiles to the same SASS FFMA/LDG/LDS/SHFL instructions as CUDA. Applying SMEM X caching (Decode), +1 padding + reg double-buffering (SIMT), SMEM aliasing (CoopMat), and Split-K for narrow layers removes the remaining SM stalls.">
+        <rect x="20" y="625" width="1240" height="105" fill="#171d29" stroke="#2d3345"/>
+        <text x="38" y="654" class="t">Hardware Bottleneck Checklist (Why Cores Stall &amp; How Each Optimization Fixes It)</text>
+        <text x="38" y="678" class="s">1. BAR.SYNC Stall (SIMT): Fixed by Register Double-Buffering — overlap LDG(k0+BK) with FFMA(k0) without 2x SMEM.</text>
+        <text x="38" y="696" class="s">2. 1 WG/SM Occupancy (CoopMat): Fixed by aliasing Cs over Ws/Xs (&lt;24 KB SMEM) -&gt; 2+ WG/SM hides barrier latency.</text>
+        <text x="38" y="714" class="s">3. Bank Conflicts &amp; Redundant Loads: +1 vec4 SMEM pad (q4_gemm) + SMEM Xs cache in q4_matmul (8x fewer X reads) + Split-K when gx*gy &lt; num_SMs.</text>
+      </g>
+
+      <!-- Edges -->
+      <path d="M 410 97 L 162 150" class="edge"/>
+      <path d="M 490 97 L 490 150" class="edge"/>
+      <path d="M 570 97 L 822 150" class="edge"/>
+      <path d="M 650 80 L 1132 150" class="edge"/>
+
+      <path d="M 162 218 L 162 250" class="edge opt"/>
+      <path d="M 162 322 L 162 355" class="edge"/>
+      <path d="M 490 218 L 490 250" class="edge opt"/>
+      <path d="M 490 322 L 490 355" class="edge opt"/>
+      <path d="M 822 218 L 822 250" class="edge opt"/>
+      <path d="M 822 322 L 822 355" class="edge"/>
+
+      <path d="M 162 427 L 420 510" class="edge"/>
+      <path d="M 490 427 L 560 510" class="edge"/>
+      <path d="M 822 427 L 760 510" class="edge"/>
+      <path d="M 1132 322 L 880 510" class="edge"/>
+    </svg>
+  </div>
+
+  <div class="tip" id="tip">Click any node in the graph above to inspect its exact shader file, SMEM layout, and SASS-level behavior.</div>
+
+  <h2>Stage-by-Stage Shader &amp; SMEM Comparison</h2>
+  <table>
+    <thead>
+      <tr><th>Shader / Tier</th><th>Current Implementation</th><th>Proposed Optimization</th><th>Hardware Impact</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>q4_matmul.comp</code><br><code>matmul_fp8.comp</code></td>
+        <td><code>256</code> threads (8 warps), 1 row/warp, <code>subgroupAdd</code>. Reads <code>X</code> from global/L1 in every warp.</td>
+        <td>Cache active <code>X</code> tile in <code>shared vec4 Xs[]</code> when <code>NT &gt;= 2</code>; 128-thread WG or Split-K when <code>gx &lt; num_SMs</code>.</td>
+        <td>Up to 8× fewer <code>X</code> loads during MTP drafting; keeps all SMs busy on narrow Q/K/V layers.</td>
+      </tr>
+      <tr>
+        <td><code>q4_gemm.comp</code><br><code>gemm_fp8.comp</code></td>
+        <td>Synchronous <code>LDG → dequant → STS → BAR → FFMA → BAR</code>. Power-of-2 <code>Ws[32][16]</code> stride.</td>
+        <td>Coalesced raw block staging + <code>Ws[32][17]</code> (<code>+1</code> pad) + register double-buffering of next tile <code>k0 + BK</code>.</td>
+        <td>Eliminates SMEM store bank conflicts; overlaps global memory latency with <code>FFMA</code>.</td>
+      </tr>
+      <tr>
+        <td><code>gemm_coop.comp</code></td>
+        <td><code>Ws, Ws2, Xs, Xl, Cs</code> all live simultaneously (~37 KB SMEM/WG).</td>
+        <td>Alias <code>Cs</code> over <code>Ws</code>/<code>Xs</code> after the <code>K</code>-loop finishes (&lt;24 KB SMEM/WG).</td>
+        <td>Doubles workgroups/SM (2+ WG/SM on 48–64 KB SMs) so warps switch across <code>BAR.SYNC</code>.</td>
+      </tr>
+      <tr>
+        <td><code>attention.comp</code></td>
+        <td><code>shared float sacc[8][D]</code> with power-of-2 row stride (<code>D = 128/256</code>).</td>
+        <td>Pad to <code>sacc[8][D + 4]</code> for cross-subgroup head reduction.</td>
+        <td>Eliminates bank conflicts during final attention output merge.</td>
+      </tr>
+    </tbody>
+  </table>
+</main>
+
+<script>
+const tip = document.getElementById('tip');
+for (const n of document.querySelectorAll('.node')) {
+  n.addEventListener('click', () => { tip.innerHTML = n.dataset.info; });
+}
+</script>
+</body>
+</html>
