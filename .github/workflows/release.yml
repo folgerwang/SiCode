@@ -23,11 +23,12 @@ jobs:
           - os: windows-latest
             plat: win_amd64
             exe: qwen.exe
-            cmake_args: -DQW_NATIVE=OFF -DQW_VULKAN=OFF
+            cmake_args: -DQW_NATIVE=OFF -DQW_VULKAN=ON
           - os: ubuntu-latest
             plat: manylinux_2_28_x86_64
             exe: qwen
-            cmake_args: -DQW_NATIVE=OFF -DQW_VULKAN=OFF
+            cmake_args: -DQW_NATIVE=OFF -DQW_VULKAN=ON
+          # macOS has no native Vulkan (only MoltenVK, not tested with these shaders): CPU backend only
           - os: macos-latest
             plat: macosx_11_0_arm64
             exe: qwen
@@ -39,6 +40,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # The Vulkan backend needs the headers, the loader library and glslc (the shaders are compiled into the
+      # engine). At run time the engine only needs the GPU driver's Vulkan loader.
+      - name: Install Vulkan SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ver = "1.4.341.1"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe" -OutFile "$env:RUNNER_TEMP\vulkansdk.exe"
+          $p = Start-Process -Wait -PassThru "$env:RUNNER_TEMP\vulkansdk.exe" -ArgumentList "--root C:\VulkanSDK --accept-licenses --default-answer --confirm-command install"
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer exited with $($p.ExitCode)" }
+          if (-not (Test-Path C:\VulkanSDK\Bin\glslc.exe)) { throw "glslc.exe not found after installing the Vulkan SDK" }
+          "VULKAN_SDK=C:\VulkanSDK" >> $env:GITHUB_ENV
+
+      - name: Install Vulkan headers, loader and glslc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev glslc
 
       - name: Configure and build qwen engine
         run: |
