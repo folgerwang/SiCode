@@ -104,6 +104,7 @@ class Task:
         self.summary = ""      # replaces the transcript as the seed of the next local conversation (compact)
         self.messages = []     # Claude's conversation for this task (kept in memory only)
         self.sessions = {}     # planner -> the session id of its command-line tool, to continue with
+        self.session_upto = {} # session_key -> len(self.items) at end of that provider's last turn
         self.undo = []         # (label, {path: content before}) per request that changed files
         self.changed = {}      # path -> content before the task first changed it (None: new file)
         self.model_usage = {}  # model_label -> {"runs": int, "tokens": int, "cost": float, "cloud": bool}
@@ -122,7 +123,8 @@ class Task:
         os.makedirs(TASKS_DIR, exist_ok=True)
         with open(os.path.join(TASKS_DIR, self.id + ".json"), "w", encoding="utf-8") as f:
             json.dump({**self.head(), "started": None, "items": self.items, "summary": self.summary,
-                       "sessions": self.sessions, "model_usage": self.model_usage}, f)
+                       "sessions": self.sessions, "session_upto": self.session_upto,
+                       "model_usage": self.model_usage}, f)
 
     @staticmethod
     def load(path):
@@ -132,26 +134,61 @@ class Task:
         t.title, t.created, t.items, t.summary = d["title"], d["created"], d["items"], d.get("summary", "")
         t.elapsed = float(d.get("elapsed") or 0.0)
         t.sessions = d.get("sessions") or {}
+        t.session_upto = d.get("session_upto") or {}
         t.model_usage = d.get("model_usage") or {}
         for it in t.items:  # nothing is still running or waiting after a restart
             if it.get("status") in ("pending", "running"):
                 it["status"] = "stopped"
         return t
 
-    def transcript(self, limit=12000):
-        """What was said so far, to seed a new conversation of the local model with."""
+    def transcript(self, limit=24000, start=0, end=None):
+        """What was said so far, to seed a new or switched model conversation with."""
         parts = []
-        for it in self.items:
+        for it in self.items[start:end]:
             if it["type"] == "user":
                 parts.append("User: " + it["text"])
             elif it["type"] == "assistant" and it.get("text"):
-                parts.append("Assistant: " + it["text"])
+                who = it.get("who") or "assistant"
+                parts.append(f"Assistant ({who}): " + it["text"])
             elif it["type"] == "diff" and it.get("status") == "applied":
                 parts.append(f"[changed {it['path']}]")
             elif it["type"] == "command" and it.get("status") == "done":
                 parts.append(f"[ran: {it['command'][:200]}]")
         text = "\n\n".join(parts)
         return text[-limit:]
+
+    def compact_transcript(self, start=0, end=None, limit=4500):
+        """Compacted context summary for hand-off when switching cloud providers."""
+        slice_items = self.items[start:end]
+        if not slice_items:
+            return ""
+        changed, cmds, turns = [], [], []
+        total = len(slice_items)
+        for i, it in enumerate(slice_items):
+            tp = it.get("type")
+            recent = i >= total - 4
+            if tp == "user":
+                turns.append("User: " + clip(str(it.get("text") or "").strip(), 400 if recent else 220))
+            elif tp == "assistant" and it.get("text"):
+                who = it.get("who") or "assistant"
+                txt = str(it["text"]).strip()
+                cap = 600 if recent else 260
+                if len(txt) > cap:
+                    txt = txt[:cap // 2].rstrip() + " ... " + txt[-(cap // 2):].lstrip()
+                turns.append(f"Assistant ({who}): {txt}")
+            elif tp == "diff" and it.get("status") == "applied" and it.get("path"):
+                if it["path"] not in changed:
+                    changed.append(it["path"])
+            elif tp == "command" and it.get("status") == "done" and it.get("command"):
+                cmds.append(str(it["command"]).strip().splitlines()[0][:120])
+        out = []
+        if changed:
+            out.append("Files changed: " + ", ".join(changed[-20:]))
+        if cmds:
+            out.append("Commands run: " + "; ".join(cmds[-8:]))
+        if turns:
+            out.append("\n".join(turns))
+        return "\n".join(out)[-limit:]
 
 
 class Web:
@@ -517,9 +554,10 @@ class Web:
             def _run_watchdog():
                 done_ev = threading.Event()
                 if self.watchdog_minutes > 0:
+                    run_ctx = self._run()
                     threading.Thread(
                         target=self._local_watchdog,
-                        args=(self.task, text, self.run_id, done_ev),
+                        args=(self.task, text, run_ctx.get("run_id"), done_ev, run_ctx),
                         daemon=True,
                     ).start()
                 return done_ev
@@ -579,11 +617,17 @@ class Web:
         act = "stop" if re.search(r"\bstop\b", low) and not re.search(r"\bwait\b", low) else "wait"
         return act, (raw.splitlines()[0][:160] if raw else "no details")
 
-    def _local_watchdog(self, task, request_text, rid, done_ev):
+    def _local_watchdog(self, task, request_text, rid, done_ev, run_ctx=None):
+        self._ctx.run = run_ctx or self.active.get(task.id) or {
+            "task": task, "ws": None, "stop": False, "run_id": rid,
+            "cmd_item": None, "tool_item": None, "sub": False, "by": "",
+            "planner_chat": None, "monitor_chat": None,
+        }
         interval = max(10.0, self.watchdog_minutes * 60.0)
         t_start = time.monotonic()
         while not done_ev.wait(interval):
-            if self.stop or self.run_id != rid or self.busy != task.id:
+            cur_ctx = self.active.get(task.id)
+            if self.stop or not cur_ctx or cur_ctx.get("run_id") != rid:
                 return
             if self.waiting:
                 continue
@@ -607,19 +651,34 @@ class Web:
             )
             note = self.add(type="note", text=f"Cloud monitor ({elapsed_m:.0f}m): checking local job ...", status="running")
             try:
-                reply = self._cloud_check(prompt, lambda: done_ev.is_set() or self.stop or self.run_id != rid)
+                reply = self._cloud_check(prompt, lambda: done_ev.is_set() or self.stop or self.active.get(task.id, {}).get("run_id") != rid)
                 action, reason = self._parse_monitor_decision(reply)
             except Exception as e:
                 self.update(note, status="done", text=f"Cloud monitor skipped: {str(e)[:160]}")
                 continue
-            if done_ev.is_set() or self.stop or self.run_id != rid:
+            if done_ev.is_set() or self.stop or self.active.get(task.id, {}).get("run_id") != rid:
                 self.update(note, status="done")
                 return
             if action == "stop":
                 self.update(note, status="done", text=f"Cloud monitor: STOP — {reason}")
-                self.force_stop()
+                self.force_stop(task.id)
                 return
             self.update(note, status="done", text=f"Cloud monitor: WAIT — {reason}")
+
+    def _with_missing_context(self, task, session_key, prompt_text, prior="", has_session=True):
+        """Pass compacted prior context (when switching to a new provider) or compacted delta turns."""
+        cur_end = max(0, len(task.items) - 1)  # exclude the just-added user message
+        if not has_session or session_key not in task.session_upto:
+            seed = task.summary or task.compact_transcript(end=cur_end) or prior
+            if seed:
+                return f"Compacted context from earlier turns in this task:\n{seed}\n\nCurrent request:\n{prompt_text}"
+            return prompt_text
+        prev_idx = int(task.session_upto[session_key])
+        if prev_idx < cur_end:
+            delta = task.compact_transcript(start=prev_idx, end=cur_end)
+            if delta:
+                return f"Compacted updates from other models since your last turn:\n{delta}\n\nCurrent request:\n{prompt_text}"
+        return prompt_text
 
     def local_turn(self, text, prior):
         t = self.task
@@ -628,9 +687,12 @@ class Web:
             seed = t.summary or prior
             if seed:
                 text = f"Summary of the conversation so far:\n{seed}\n\nThe user's next request:\n{text}"
+        else:
+            text = self._with_missing_context(t, "local", text, prior=prior, has_session=True)
         self.engine_task, self.local_open = t.id, True
         t0 = time.time()
         _, stats = self.run_local(text, DIRECT_PROMPT, fresh)
+        t.session_upto["local"] = len(t.items)
         speed = stats["gen_tokens"] / max(stats["gen_s"], 1e-9)
         self.add(type="stats", text=f"Local model: {stats['steps']} steps, {stats['gen_tokens']:,} tokens at "
                                     f"{speed:.0f} tok/s, {time.time() - t0:.0f} s")
@@ -680,8 +742,10 @@ class Web:
             self.on_result(result)
         return {"type": "tool_result", "tool_use_id": block.id, "content": result}
 
-    def claude_turn(self, text, solo=False, media_items=None):
+    def claude_turn(self, text, solo=False, media_items=None, prior=""):
         t = self.task
+        key = "api" + (":solo" if solo else "")
+        text = self._with_missing_context(t, key, text, prior=prior, has_session=bool(t.messages))
         if self.client is None:
             if not have_credentials():
                 self.add(type="error", text="No Claude API key is set. Add one in Settings, or switch this request "
@@ -743,6 +807,7 @@ class Web:
                     return
                 calls = [b for b in msg.content if b.type == "tool_use"]
                 if msg.stop_reason != "tool_use" or not calls:
+                    t.session_upto[key] = len(t.items)
                     return
                 t.messages.append({"role": "user", "content": [self.run_tool(b) for b in calls]})
         except KeyboardInterrupt:
@@ -843,12 +908,13 @@ class Web:
         finally:
             self.sub = False
 
-    def login_turn(self, text, solo=False, planner_id=None, media_items=None, effort=None):
+    def login_turn(self, text, solo=False, planner_id=None, media_items=None, effort=None, prior=""):
         """Cloud CLI planner: hybrid (Mix) or working alone (cloud)."""
         p = planner_id or self.planner
         t = self.task
         label = planners.PLANNERS[p]
         key = p + (":solo" if solo else "")
+        text = self._with_missing_context(t, key, text, prior=prior, has_session=bool(t.sessions.get(key)))
         p_info = self._providers_summary(p)
         c_ratio = self.project_cloud_ratio.get(os.path.realpath(t.workspace), 10)
         imgs = [m["path"] for m in (media_items or []) if str(m.get("mime", "")).startswith("image/")]
@@ -888,6 +954,7 @@ class Web:
         finally:
             if chat.session:
                 t.sessions[key] = chat.session
+            t.session_upto[key] = len(t.items)
             self.planner_chat = None
             if note[0] is not None:
                 self.update(note[0], status="done")
@@ -1001,10 +1068,10 @@ class Web:
                 used_p, used_ef = active_p, active_ef
                 if active_p != "api":
                     self.login_turn(prompt_text, solo=route == "cloud", planner_id=active_p,
-                                    media_items=media_items, effort=active_ef)
+                                    media_items=media_items, effort=active_ef, prior=prior)
                 else:
                     self._record_planner_usage("api")
-                    self.claude_turn(prompt_text, solo=route == "cloud", media_items=media_items)
+                    self.claude_turn(prompt_text, solo=route == "cloud", media_items=media_items, prior=prior)
             else:
                 self.local_turn(prompt_text, prior)
             ok = True
