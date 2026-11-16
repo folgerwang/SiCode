@@ -31,7 +31,7 @@ DEFAULT_MODEL = os.environ.get("SICODE_MODEL") or _first([
     os.path.join(HOME_MODELS, MODEL_DIR, MODEL_QUANT)])
 
 
-def local_models():
+def local_models(also=()):
     """The model folders found next to the engine's checkout and in ~/.sicode/models: [{path, label}].
 
     A GGUF quantisation is a folder of .gguf files (models/<name>/<quant>); an FP8 model is a folder named *-FP8
@@ -54,6 +54,10 @@ def local_models():
                     found.setdefault(os.path.normcase(d), {"path": d, "label": f"{name.removesuffix('-FP8')} (FP8)"})
             except OSError:
                 continue
+    for extra in also:  # a model chosen by path, outside the two folders
+        if extra and os.path.exists(extra) and os.path.normcase(extra) not in found:
+            parent = os.path.basename(os.path.dirname(extra))
+            found[os.path.normcase(extra)] = {"path": extra, "label": f"{parent}/{os.path.basename(extra)}"}
     out = list(found.values())
     key = os.path.normcase(DEFAULT_MODEL)
     if os.path.exists(DEFAULT_MODEL) and key not in found:

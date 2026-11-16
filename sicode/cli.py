@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-from . import __version__, planners
+from . import __version__, planners, sysinfo
 from .tools import MEDIA_EXTS, TOOLS, Workspace, clip, read_clipboard_media
 from .worker import (DEFAULT_EXE, DEFAULT_MODEL, DIRECT_PROMPT, WORKER_PROMPT, Engine, local_models, parse_reply,
                      run_task)
@@ -46,7 +46,10 @@ HELP = f"""{BOLD}Requests{OFF}
   /help            this text
   /clear           start new conversations (local and Claude)
   /compact         replace the local conversation by its summary, to free context
-  /context         context use, tokens spent, mode, models
+  /context         models, context use, tokens spent, memory, mode
+  /status          RAM, VRAM and the VRAM cache rate
+  /vram [GB]       the most VRAM that may be in use on the card (0: no cap)
+  /dir [path]      show or switch the working folder (starts new conversations)
   /diff            git diff of the workspace
   /undo            put back the files changed by the last request
   /init            have the local model write SICODE.md, the project notes loaded into every conversation
@@ -422,6 +425,34 @@ class App:
         if result.startswith("error"):
             print(f"{DIM}      {result.splitlines()[0][:150]}{OFF}")
 
+    def status_lines(self):
+        """RAM, VRAM and the VRAM cache rate, as the page shows them in its top bar."""
+        gb = lambda b: f"{b / 1073741824:.1f}"
+        out = []
+        ram, vram = sysinfo.ram(), sysinfo.vram()
+        if ram:
+            mine = sysinfo.process_ram(self.engine.proc.pid) if self.engine else None
+            out.append(f"  RAM             {gb(ram[0])} of {gb(ram[1])} GB in use"
+                       + (f" (the local model holds {gb(mine)} GB)" if mine else ""))
+        cap = vram_cap(self.a)
+        if vram:
+            out.append(f"  VRAM            {gb(vram[0])} of {gb(vram[1])} GB in use, all programs"
+                       + (f"; cap {cap:g} GB" if cap else "; no cap (/vram sets one)"))
+        c = self.engine.cache if self.engine else None
+        if c and c["hits"] + c["misses"]:
+            last = f"{100 * c['last']:.0f}% in the last reply, " if c["last"] is not None else ""
+            out.append(f"  VRAM cache rate {last}{100 * c['hits'] / (c['hits'] + c['misses']):.0f}% since the model "
+                       f"loaded ({c['cached']:,} of {c['experts']:,} experts in VRAM)")
+        else:
+            out.append("  VRAM cache rate shown after the first local reply")
+        return out
+
+    def unload_engine(self):
+        """Closes the local model so that the next request loads it again (with a new model or VRAM cap)."""
+        if self.engine:
+            self.engine.close()
+            self.engine, self.local_open = None, False
+
     # --- the local model ---
 
     def start_engine(self):
@@ -462,8 +493,10 @@ class App:
             print(f"{YELLOW}[interrupted]{OFF}")
             return
         speed = stats["gen_tokens"] / max(stats["gen_s"], 1e-9)
+        rate = engine.cache["last"]
+        cache = f", VRAM cache rate {100 * rate:.0f}%" if rate is not None else ""
         print(f"{DIM}[local: {stats['steps']} steps, {stats['gen_tokens']:,} tokens at {speed:.0f} tok/s, "
-              f"context {stats['ctx_used']:,} of {engine.ctx:,}, {time.time() - t0:.0f} s]{OFF}")
+              f"context {stats['ctx_used']:,} of {engine.ctx:,}{cache}, {time.time() - t0:.0f} s]{OFF}")
 
     def compact(self):
         if not self.local_open:
@@ -789,11 +822,51 @@ class App:
             used = self.engine.ctx_used if self.engine and self.local_open else 0
             ctx = f"{used:,} of {self.engine.ctx:,} tokens" if self.engine else "model not loaded yet"
             notes = self.instructions_name or "none (/init writes SICODE.md)"
-            print(f"  local context   {ctx}\n  local tokens    {u['local']:,} written\n"
-                  f"  Claude          {self.a.model}, effort {self.a.effort}: {u['in']:,} in, {u['cache_read']:,} "
-                  f"cached, {u['out']:,} out, {len(self.messages)} messages\n"
+            local = next((m["label"] for m in local_models((self.a.worker_model,)) if os.path.normcase(m["path"]) ==
+                          os.path.normcase(self.a.worker_model)), self.a.worker_model)
+            cloud = planners.PLANNERS[self.planner] + (f", {self.a.model}, effort {self.a.effort}"
+                                                       if self.planner == "api" else "")
+            print(f"  local model     {local}\n  local context   {ctx}\n  local tokens    {u['local']:,} written\n"
+                  f"  cloud model     {cloud}\n"
+                  f"  Claude API      {u['in']:,} in, {u['cache_read']:,} cached, {u['out']:,} out, "
+                  f"{len(self.messages)} messages\n"
+                  + "\n".join(self.status_lines()) + "\n"
                   f"  mode            {self.mode}: {MODES[self.mode]}\n  project notes   {notes}\n"
                   f"  workspace       {self.ws.root}")
+        elif name == "/status":
+            print("\n".join(self.status_lines()))
+        elif name == "/vram":
+            if arg:
+                try:
+                    gb = max(0.0, float(arg))
+                except ValueError:
+                    print(f"{RED}give the cap in GB, or 0 for none{OFF}")
+                    return True
+                changed = gb != vram_cap(self.a)
+                self.a.vram_cap = gb
+                try:
+                    save_config(vram_cap_gb=gb)
+                except OSError:
+                    pass
+                if changed and self.engine:
+                    self.unload_engine()
+                    print(f"{DIM}[the local model reloads with the next request]{OFF}")
+            cap = vram_cap(self.a)
+            print(f"{DIM}VRAM cap: {f'{cap:g} GB in use on the card, counting other programs' if cap else 'none'}{OFF}")
+        elif name == "/dir":
+            if arg:
+                root = os.path.realpath(os.path.expanduser(arg.strip('"')))
+                if not os.path.isdir(root):
+                    print(f"{RED}{root} is not a folder{OFF}")
+                    return True
+                # a new working folder is a new job: both conversations start afresh
+                self.ws = Workspace(root, self.approve_command, self.approve_edit, self.show_plan)
+                self.messages.clear()
+                self.planner_chat = None
+                self.local_open, self.summary, self.undo = False, "", []
+                self.instructions_name, self.instructions = self.load_instructions()
+            notes = f"project notes {self.instructions_name}" if self.instructions_name else "no project notes (/init)"
+            print(f"{DIM}workspace {self.ws.root}; {notes}{OFF}")
         elif name == "/diff":
             print(self.git_diff() or f"{DIM}[no changes against the last commit, or not a git repository]{OFF}")
         elif name == "/undo":
@@ -828,16 +901,14 @@ class App:
                 found = "" if k == "api" or planners.find(k) else " (its tool is not installed)"
                 print(f"  {'*' if k == self.planner else ' '} {k:12s} {v}{found}")
         elif name == "/local":
-            models = local_models()
+            models = local_models((self.a.worker_model,))
             if arg.isdigit() and 1 <= int(arg) <= len(models):
                 self.a.worker_model = models[int(arg) - 1]["path"]
                 try:
                     save_config(local_model=self.a.worker_model)
                 except OSError:
                     pass
-                if self.engine:  # the next request loads the chosen model
-                    self.engine.close()
-                    self.engine, self.local_open = None, False
+                self.unload_engine()  # the next request loads the chosen model
             elif arg:
                 print(f"{RED}give the number of a model from the list{OFF}")
             for i, m in enumerate(models, 1):
@@ -975,7 +1046,7 @@ class App:
     def repl(self):
         notes = f"project notes {self.instructions_name}" if self.instructions_name else "no project notes (/init)"
         who = f"Claude {self.a.model}" if self.planner == "api" else planners.PLANNERS[self.planner]
-        print(f"{BOLD}SiCode{OFF}  local Qwen3.8-Flash-Next; [c] plans with: {who}\n"
+        print(f"{BOLD}SiCode{OFF} {__version__}  requests run on the local model; [m] mix, [c] cloud: {who}\n"
               f"{DIM}workspace {self.ws.root}\nmode {self.mode}: {MODES[self.mode]}; {notes}\n"
               f"/help lists the commands{OFF}")
         if self.planner == "api" and not have_credentials():  # an account login needs no key
@@ -1075,7 +1146,10 @@ def main():
     app = App(a)
     if a.prompt:
         try:
-            app.turn(a.prompt)
+            if a.prompt.startswith("/"):  # a command such as /status, run once
+                app.command(a.prompt)
+            else:
+                app.turn(a.prompt)
         finally:
             app.close()
     else:

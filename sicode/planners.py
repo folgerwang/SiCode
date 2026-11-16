@@ -23,7 +23,7 @@ PLANNERS = {
     "codex": "ChatGPT account (through Codex)",
     "agy": "Google account (through Antigravity)",
     "codebuddy": "Tencent CodeBuddy CLI",
-    "tcloud": "Tencent Cloud AI CLI",
+    "tcloud": "Tencent account (through TClaude)",
 }
 
 PLANNER_BINS = {
@@ -31,7 +31,7 @@ PLANNER_BINS = {
     "codex": "codex",
     "agy": "agy",
     "codebuddy": "codebuddy",
-    "tcloud": "tcloud",
+    "tcloud": "tclaude",   # Tencent's wrapper around Claude Code: it forwards its arguments to Claude Code
 }
 
 SPLIT = """Two of you do the work, and every step of the job goes to one of you:
@@ -170,6 +170,42 @@ def agy_models():
     return _AGY_MODELS_CACHE
 
 
+_TCLAUDE_MODELS_CACHE = (None, [])
+
+
+def tclaude_models():
+    """The models TClaude's gateway offers this account: [{id, label}], the account's default first-marked.
+
+    TClaude saves the list it last fetched in ~/.tclaude/cache/gateway-models.json; the model it uses when none is
+    given is the "model" of ~/.tclaude/settings.json."""
+    global _TCLAUDE_MODELS_CACHE
+    home = os.path.join(os.path.expanduser("~"), ".tclaude")
+    path = os.path.join(home, "cache", "gateway-models.json")
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return []
+    if _TCLAUDE_MODELS_CACHE[0] == stamp:
+        return _TCLAUDE_MODELS_CACHE[1]
+    models = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for m in json.load(f).get("models") or []:
+                if isinstance(m, dict) and m.get("id"):
+                    models.append({"id": str(m["id"]), "label": str(m.get("display_name") or m["id"])})
+        try:
+            with open(os.path.join(home, "settings.json"), encoding="utf-8") as f:
+                default = str(json.load(f).get("model") or "")
+        except (OSError, ValueError):
+            default = ""
+        for m in models:
+            m["default"] = m["id"] == default
+    except (OSError, ValueError, AttributeError):
+        models = []
+    _TCLAUDE_MODELS_CACHE = (stamp, models)
+    return models
+
+
 _EFFORT_SUFFIX_RE = re.compile(r"-(low|medium|high|xhigh|max)$")
 _EFFORT_LABEL_RE = re.compile(r"\s*\((Low|Medium|High|XHigh|Max)\)$")
 
@@ -249,21 +285,85 @@ def _count_recent_dirs(root, now):
     return c5, c24
 
 
+_CODEX_USAGE_CACHE = (0.0, None)
+_RATE_LIMITS_RE = re.compile(rb'"rate_limits"\s*:\s*(\{.*\})\s*\}\s*\}\s*$')
+
+
+def _codex_usage(home, now):
+    """What Codex itself last recorded: (sessions in 5 h, sessions in 24 h, percent of the limit left or None).
+
+    Codex writes one rollout file per session under ~/.codex/sessions/<year>/<month>/<day>; its token_count events
+    carry the account's rate limits as the server reported them (percent used and reset time of each window).
+    `codex exec`, which SiCode uses, does not write ~/.codex/history.jsonl, so that file says nothing here."""
+    global _CODEX_USAGE_CACHE
+    if now - _CODEX_USAGE_CACHE[0] < 20 and _CODEX_USAGE_CACHE[1] is not None:
+        return _CODEX_USAGE_CACHE[1]
+    root = os.path.join(home, ".codex", "sessions")
+    files = []
+    try:
+        days = []
+        for y in sorted(os.listdir(root), reverse=True)[:2]:
+            for m in sorted(os.listdir(os.path.join(root, y)), reverse=True)[:2]:
+                for d in sorted(os.listdir(os.path.join(root, y, m)), reverse=True):
+                    days.append(os.path.join(root, y, m, d))
+        for day in days[:3]:   # the newest days that have sessions
+            for e in os.scandir(day):
+                if e.name.endswith(".jsonl"):
+                    files.append((e.stat().st_mtime, e.path))
+    except OSError:
+        pass
+    files.sort(reverse=True)
+    c5 = sum(1 for mt, _ in files if mt >= now - 18000)
+    c24 = sum(1 for mt, _ in files if mt >= now - 86400)
+    left = None
+    for _, path in files[:5]:
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 262144))
+                tail = f.read().splitlines()
+        except OSError:
+            continue
+        limits = None
+        for line in reversed(tail):
+            m = _RATE_LIMITS_RE.search(line)
+            if m:
+                try:
+                    limits = json.loads(m.group(1))
+                except ValueError:
+                    continue
+                break
+        if isinstance(limits, dict):
+            used = 0.0
+            for w in ("primary", "secondary"):
+                win = limits.get(w)
+                # a window whose reset time has passed starts again from nothing
+                if isinstance(win, dict) and float(win.get("resets_at") or 0) > now:
+                    used = max(used, float(win.get("used_percent") or 0.0))
+            left = round(max(0.0, 100.0 - used), 1)
+            break
+    _CODEX_USAGE_CACHE = (now, (c5, c24, left))
+    return _CODEX_USAGE_CACHE[1]
+
+
 def detect_account_usage():
     """Inspect local CLI history/session files to estimate recent usage per provider."""
     now = time.time()
     home = os.path.expanduser("~")
+    codex5, codex24, codex_left = _codex_usage(home, now)
     counts = {
         "claude-code": _count_jsonl_timestamps(os.path.join(home, ".claude", "history.jsonl"), "timestamp", 1000.0, now),
-        "codex": _count_jsonl_timestamps(os.path.join(home, ".codex", "history.jsonl"), "ts", 1.0, now),
+        "codex": (codex5, codex24),
         "agy": _count_recent_dirs(os.path.join(home, ".gemini", "antigravity-cli", "brain"), now),
         "codebuddy": _count_recent_dirs(os.path.join(home, ".codebuddy"), now),
-        "tcloud": _count_recent_dirs(os.path.join(home, ".tcloud"), now),
+        "tcloud": _count_jsonl_timestamps(os.path.join(home, ".tclaude", "history.jsonl"), "timestamp", 1000.0, now),
     }
     out = {}
     for k in PLANNERS:
         u5, u24 = counts.get(k, (0, 0))
         est_left = max(5.0, round(100.0 - min(95.0, u5 * 2.5), 1)) if u5 > 0 else 100.0
+        if k == "codex" and codex_left is not None:
+            est_left = codex_left   # the server's own figure, not a guess from the number of requests
         out[k] = {"used_5h": u5, "used_24h": u24, "est_quota_left": est_left}
     return out
 
@@ -414,13 +514,20 @@ class Planner:
 
     def ask(self, prompt, should_stop=lambda: False):
         """Sends one message and returns the planner's reply text."""
-        if self.planner == "claude-code":
+        if self.planner in ("claude-code", "tcloud"):
+            wrapped = self.planner == "tcloud"
+            brand, cmd = ("TClaude", "tclaude login") if wrapped else ("Claude Code", "claude")
             if self.raw:
                 args = ["-p", "--output-format", "json", "--tools", ""]
             else:
                 tools = "Read,Grep,Glob,Edit,Write" + (",Bash" if self.allow_shell else "")
-                args = ["-p", "--output-format", "json", "--tools", tools, "--permission-mode", "acceptEdits",
-                        "--append-system-prompt", self._system_prompt(self.allow_shell)]
+                args = ["-p", "--output-format", "json", "--tools", tools, "--permission-mode", "acceptEdits"]
+                if not wrapped:
+                    args += ["--append-system-prompt", self._system_prompt(self.allow_shell)]
+                elif not self.session:
+                    # tclaude is an npm .cmd launcher on Windows: a multi-line argument would be cut at the first
+                    # newline, so the instructions travel with the first message on stdin instead
+                    prompt = self._system_prompt(self.allow_shell) + "\n\n# The user's request\n\n" + prompt
                 if self.allow_shell:
                     args += ["--allowedTools", "Bash"]
             if self.session:
@@ -438,11 +545,11 @@ class Planner:
                 except ValueError:
                     continue
             if not isinstance(data, dict):
-                raise RuntimeError("Claude Code gave no reply" + (": " + (err or text).strip()[-400:] if err or text else ""))
+                raise RuntimeError(f"{brand} gave no reply" + (": " + (err or text).strip()[-400:] if err or text else ""))
             self.session = data.get("session_id") or self.session
             if data.get("is_error"):
-                raise RuntimeError("Claude Code: " + str(data.get("result") or data.get("subtype") or "error")[:400]
-                                   + " (run `claude` once in a terminal to sign in, if that is the problem)")
+                raise RuntimeError(f"{brand}: " + str(data.get("result") or data.get("subtype") or "error")[:400]
+                                   + f" (run `{cmd}` once in a terminal to sign in, if that is the problem)")
             return str(data.get("result") or "")
         if self.planner == "codex":
             if self.session:
@@ -504,21 +611,15 @@ class Planner:
             if data.get("status") != "SUCCESS" and not data.get("response"):
                 raise RuntimeError("Antigravity: " + str(data.get("error") or data.get("status") or "error")[:400])
             return str(data.get("response") or "")
-        if self.planner in ("codebuddy", "tcloud"):
+        if self.planner == "codebuddy":
             if not self.session and not self.raw:
                 prompt = self._system_prompt(self.allow_shell) + "\n\n# The user's request\n\n" + prompt
-            if self.planner == "codebuddy":
-                args = ["-p", "--output-format", "json"]
-                if self.session:
-                    args += ["--resume", self.session]
-                if self.model:
-                    args += ["--model", self.model]
-                code, text, err = self._run(args, prompt, should_stop)
-            else:
-                args = ["ai", "chat", "--prompt", prompt, "--output", "json"]
-                if self.model:
-                    args += ["--model", self.model]
-                code, text, err = self._run(args, None, should_stop)
+            args = ["-p", "--output-format", "json"]
+            if self.session:
+                args += ["--resume", self.session]
+            if self.model:
+                args += ["--model", self.model]
+            code, text, err = self._run(args, prompt, should_stop)
             data = None
             for line in reversed(text.strip().splitlines()):
                 try:

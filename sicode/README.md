@@ -90,7 +90,12 @@ diff. Ctrl+C stops the current reply and keeps the conversation.
 | `/help` | lists everything here |
 | `/clear` | starts new conversations (local and Claude) |
 | `/compact` | replaces the local conversation by its summary, to free context |
-| `/context` | context use, tokens spent, mode, models |
+| `/context` | models, context use, tokens spent, memory, mode |
+| `/status` | RAM, VRAM and the VRAM cache rate |
+| `/vram [GB]` | the most VRAM that may be in use on the card (0: no cap) |
+| `/local [number]` | lists the installed local models, or switches to one |
+| `/planner [name]` | the cloud model: `api`, `claude-code` or `codex` |
+| `/dir [path]` | shows or switches the working folder (starts new conversations) |
 | `/diff` | git diff of the workspace |
 | `/undo` | puts back the files changed by the last request |
 | `/init` | has the local model write `SICODE.md` |

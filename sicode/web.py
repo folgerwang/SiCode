@@ -351,9 +351,9 @@ class Web:
                 "project_models": project_models_out,
                 "enabled_planners": self.enabled_planners, "planner_usage": eff_usage,
                 "ml_summary": self.ml.summary()[:6],
-                "local_model": self.a.worker_model, "local_models": local_models(),
+                "local_model": self.a.worker_model, "local_models": local_models((self.a.worker_model,)),
                 "planner_models": self.planner_models, "planner_efforts": self.planner_efforts,
-                "agy_models": planners.agy_base_models(),
+                "agy_models": planners.agy_base_models(), "tclaude_models": planners.tclaude_models(),
                 "planners": [{"id": k, "label": v, "found": k == "api" or (k in avail),
                               "installed": k in avail, "enabled": bool(self.enabled_planners.get(k, False)),
                               "usage": eff_usage.get(k, {"used": 0, "used_5h": 0, "used_24h": 0, "quota_left": 100.0})}
@@ -491,7 +491,7 @@ class Web:
 
     def start_engine(self):
         if self.engine is None:
-            name = next((m["label"] for m in local_models() if os.path.normcase(m["path"]) ==
+            name = next((m["label"] for m in local_models((self.a.worker_model,)) if os.path.normcase(m["path"]) ==
                          os.path.normcase(self.a.worker_model)), os.path.basename(self.a.worker_model))
             note = self.add(type="note", text=f"Loading the local model {name} ...", status="running", progress=0.05)
             t0 = time.time()
@@ -1371,7 +1371,7 @@ class Web:
             self.push_state()
             return {"model": self.a.model, "effort": self.a.effort}
         if path == "/api/localmodel":
-            chosen = next((m for m in local_models() if m["path"] == body.get("path")), None)
+            chosen = next((m for m in local_models((self.a.worker_model,)) if m["path"] == body.get("path")), None)
             if not chosen:
                 return {"error": "that model is not installed"}
             changed = os.path.normcase(chosen["path"]) != os.path.normcase(self.a.worker_model)

@@ -353,7 +353,7 @@ function view(it) {
     w.append(b);
   } else if (it.type === 'assistant') {
     const a = el('div', 'assistant');
-    if (it.who && it.who !== 'local') a.append(el('div', 'who', {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[it.who] || 'Claude'));
+    if (it.who && it.who !== 'local') a.append(el('div', 'who', {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'TClaude'}[it.who] || 'Claude'));
     const body = el('div', 'md'); body.innerHTML = md(it.text || '');
     a.append(body); w.append(a);
   } else if (it.type === 'think') {
@@ -514,7 +514,7 @@ function renderBar() {
   const ratio = curTask ? ((st.project_cloud_ratio || {})[curTask.workspace] ?? 10) : 10;
   route = ratio <= 0 ? 'local' : ratio >= 100 ? 'cloud' : 'hybrid';
   const plId = (route === 'hybrid' && st.mix_auto && st.primary_planner) ? st.primary_planner : st.planner;
-  const brand = {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'TCloud'}[plId] || 'Claude';
+  const brand = {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'TClaude'}[plId] || 'Claude';
   const mine = isBusy(cur), b = $('send');
   b.textContent = mine ? 'Stop' : 'Send'; b.className = mine ? '' : 'primary'; b.disabled = !cur;
   $('forcestop').hidden = !mine;
@@ -806,7 +806,7 @@ function plannerNote() {
     return;
   }
   const p = st.planners.find(x => x.id === $('planner').value);
-  const name = {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'Tencent Cloud AI'}[p.id] || 'Claude Code';
+  const name = {codex: 'Codex', agy: 'Antigravity', codebuddy: 'CodeBuddy', tcloud: 'TClaude'}[p.id] || 'Claude Code';
   $('plannernote').textContent = p.id === 'api' ? 'Uses the key below; billed per token by Anthropic.'
     : p.found ? 'Uses the account you are signed in with in ' + name + '; no API key is involved. It can read the folder, and hands every change to the local model.'
     : name + ' was not found on this computer. Install it and sign in first.';
@@ -821,7 +821,7 @@ const PROVIDER_MODELS = {
           ['gpt-5.2-codex', 'GPT-5.2 Codex'], ['gpt-5.1-codex-max', 'GPT-5.1 Codex Max'],
           ['o3', 'o3'], ['o4-mini', 'o4-mini']],
   codebuddy: [['', 'Default (codebuddy)']],
-  tcloud: [['', 'Default (tcloud)']]
+  tcloud: [['', 'Default (tclaude)']]
 };
 const PROVIDER_EFFORTS = {
   api: ['low', 'medium', 'high', 'xhigh', 'max'],
@@ -829,7 +829,7 @@ const PROVIDER_EFFORTS = {
   codex: ['', 'low', 'medium', 'high', 'xhigh'],
   agy: ['', 'low', 'medium', 'high', 'xhigh', 'max'],
   codebuddy: ['', 'low', 'medium', 'high'],
-  tcloud: ['', 'low', 'medium', 'high']
+  tcloud: ['', 'low', 'medium', 'high', 'xhigh', 'max']
 };
 function makeProviderModelSelect(pId) {
   const m = el('select');
@@ -839,6 +839,10 @@ function makeProviderModelSelect(pId) {
   if (pId === 'agy') {
     m.append(new Option('Default (agy)', ''));
     for (const x of (st.agy_models || [])) m.append(new Option(x.label, x.id));
+  } else if (pId === 'tcloud' && (st.tclaude_models || []).length) {
+    const def = st.tclaude_models.find(x => x.default);
+    m.append(new Option('Default (' + (def ? def.label : 'tclaude') + ')', ''));
+    for (const x of st.tclaude_models) m.append(new Option(x.label, x.id));
   } else {
     for (const [id, label] of (PROVIDER_MODELS[pId] || [['', 'Default (' + pId + ')']])) m.append(new Option(label, id));
   }

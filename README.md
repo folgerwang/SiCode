@@ -69,7 +69,7 @@ A playable browser-based 3D MOBA arena built in TypeScript/Vite using SiCode's M
 
 ![SiCode Settings with dynamic ML cloud selection and aligned provider table](docs/sicode-settings.png)
 
-![Installing SiCode and listing its command-line options in cmd](docs/sicode-cmd.png)
+![SiCode in the terminal: a cloud-mode request that fixes a bug, then the memory status](docs/sicode-terminal.png)
 
 `sicode --web` opens the same assistant as a page in the browser: tasks, live progress, approvals and the files it
 changed. From a checkout of this repository, `pip install -e .` uses the engine and the model from the Setup section below. Details: [sicode/README.md](sicode/README.md).
