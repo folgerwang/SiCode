@@ -215,7 +215,7 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
 </main>
 
 <aside id="info">
-  <section><h3>Context <button class="ghost" id="compact" title="Replace the local conversation by its summary">Compact</button></h3><div id="context"></div></section>
+  <section><h3>Context <button class="ghost" id="unload" title="Unload the local model from RAM and VRAM">Unload</button> <button class="ghost" id="compact" title="Replace the local conversation by its summary">Compact</button></h3><div id="context"></div></section>
   <section><h3>Progress</h3><div id="progress" class="dim">No plan yet. Longer jobs show their steps here.</div></section>
   <section><h3>Changed files <button class="ghost" id="undo" title="Put back the files changed by the last request">Undo</button></h3><div id="changed" class="dim">Nothing changed in this task.</div></section>
   <section><h3>Folder</h3><div id="tree"></div></section>
@@ -524,6 +524,8 @@ function renderBar() {
   $('allocmode').textContent = ratio <= 0 ? '(Local)' : ratio >= 100 ? '(' + brand + ' only)' : '(Mix · ' + brand + ')';
   updateTimers();
   $('undo').disabled = !undoN || mine; $('compact').disabled = mine || st.ctx_task !== cur;
+  $('unload').disabled = !st.engine || isBusy(st.ctx_task || cur);
+  $('unload').title = st.engine ? 'Unload the local model from RAM and VRAM' : 'Local model is not loaded';
   const c = $('context'); c.textContent = '';
   const used = st.ctx_task === cur ? st.ctx_used : 0;
   if (st.engine) {
@@ -789,6 +791,7 @@ $('text').addEventListener('keydown', e => {
 $('mode').onchange = e => api('/api/mode', {mode: e.target.value});
 $('undo').onclick = async () => { const r = await api('/api/undo', {task: cur}); if (r.error) alert(r.error); else { undoN = r.undo; renderBar(); renderTree($('tree'), ''); } };
 $('compact').onclick = () => api('/api/send', {task: cur, text: '/compact', route: 'local'});
+$('unload').onclick = async () => { $('unload').disabled = true; await api('/api/unload', {}); };
 $('fileview').onclick = e => { const b = e.target.closest('button'); if (b) showFile(b.dataset.v); };
 document.querySelectorAll('[data-close]').forEach(b => b.onclick = () => b.closest('dialog').close());
 function plannerNote() {

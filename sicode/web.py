@@ -1209,6 +1209,13 @@ class Web:
     def api(self, path, q, body):
         if path == "/api/state":
             return self.state()
+        if path == "/api/unload":
+            unloaded = self.engine is not None
+            if unloaded:
+                self.unload_engine()
+                self.push_state()
+                self.send({"op": "sys", "sys": self.sys()})
+            return {"ok": True, "unloaded": unloaded}
         if path == "/api/check-update":
             from . import updater
             return updater.check_update()
