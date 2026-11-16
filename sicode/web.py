@@ -969,8 +969,6 @@ class Web:
 
     # --- one request ---
 
-    _MEDIA_EXTS = set(MEDIA_EXTS)
-
     def _save_media(self, task, media_list):
         import re
         import shutil
@@ -1019,8 +1017,9 @@ class Web:
             except ValueError:
                 continue
             if os.path.isfile(p):
-                if os.path.splitext(p)[1].lower() in self._MEDIA_EXTS:
-                    out += f"\n\n<attached_media path=\"{self.ws.rel(p)}\" />"
+                mime = MEDIA_EXTS.get(os.path.splitext(p)[1].lower())
+                if mime:
+                    out += f"\n\n<attached_media path=\"{self.ws.rel(p)}\" mime=\"{mime}\" />"
                 else:
                     with open(p, encoding="utf-8", errors="replace") as f:
                         out += f"\n\n<file path=\"{self.ws.rel(p)}\">\n{clip(f.read())}\n</file>"

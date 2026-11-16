@@ -59,7 +59,7 @@ HELP = f"""{BOLD}Requests{OFF}
   /planner [name]  who plans [c] requests: api, claude-code, codex, agy, codebuddy, tcloud
   /providers       show activated cloud providers & account usage; /providers enable|disable <id> | auto
   /cloud [0-100]   cloud AI share for this project (0=local, 100=cloud only & unload local, default 10)
-  /paste           attach image or video from clipboard (or press Alt+V while typing)
+  /paste           attach image, video or audio from clipboard (or press Alt+V while typing)
   /think           show or hide the local model's reasoning
   /key             set the Claude API key
   /update [check]  check GitHub for a newer SiCode release (and install it)
@@ -757,8 +757,9 @@ class App:
             except ValueError:
                 continue
             if os.path.isfile(p):
-                if os.path.splitext(p)[1].lower() in MEDIA_EXTS:
-                    out += f"\n\n<attached_media path=\"{self.ws.rel(p)}\" />"
+                mime = MEDIA_EXTS.get(os.path.splitext(p)[1].lower())
+                if mime:
+                    out += f"\n\n<attached_media path=\"{self.ws.rel(p)}\" mime=\"{mime}\" />"
                 else:
                     with open(p, encoding="utf-8", errors="replace") as f:
                         out += f"\n\n<file path=\"{self.ws.rel(p)}\">\n{clip(f.read())}\n</file>"
@@ -954,7 +955,7 @@ class App:
         elif name == "/paste":
             items = read_clipboard_media(os.path.join(self.ws.root, ".sicode", "uploads"))
             if not items:
-                print(f"{DIM}no image or video found in clipboard{OFF}")
+                print(f"{DIM}no image, video or audio found in clipboard{OFF}")
             else:
                 self.pending_media.extend(items)
                 print(f"{DIM}attached from clipboard: {', '.join(it['name'] for it in items)}{OFF}")

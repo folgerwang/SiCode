@@ -14,11 +14,13 @@ MEDIA_EXTS = {
     ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
     ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
     ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".aac": "audio/aac",
+    ".flac": "audio/flac", ".ogg": "audio/ogg", ".opus": "audio/ogg", ".wma": "audio/x-ms-wma",
 }
 
 
 def read_clipboard_media(dest_dir):
-    """Read image or copied image/video files from the Windows clipboard into dest_dir."""
+    """Read image or copied image/video/audio files from the Windows clipboard into dest_dir."""
     if os.name != "nt":
         return []
     import json as _json

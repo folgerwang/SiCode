@@ -32,7 +32,7 @@ Requires **Python 3.10+** (if `sicode` is not on `PATH` after `pip install`, run
 pip install https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.4/sicode-0.2.4-py3-none-win_amd64.whl
 sicode --download-model        # optional: local model (~115 GB) to ~/.sicode/models
 cd your-project
-sicode                         # terminal CLI (Alt+V pastes clipboard image/video)
+sicode                         # terminal CLI (Alt+V pastes clipboard image/video/audio)
 sicode --web                   # browser UI
 ```
 > Note: Windows also needs the Microsoft Visual C++ runtime (and Vulkan 1.3 GPU driver for GPU acceleration, or use `--backend cpu`).
@@ -43,7 +43,7 @@ python3 -m pip install --user https://github.com/folgerwang/SiCode/releases/down
 export PATH="$HOME/.local/bin:$PATH"
 sicode --download-model
 cd your-project
-sicode                         # terminal CLI (Alt+V pastes image/video; uses xclip/wl-paste)
+sicode                         # terminal CLI (Alt+V pastes image/video/audio; uses xclip/wl-paste)
 sicode --web                   # browser UI
 ```
 
@@ -53,7 +53,7 @@ python3 -m pip install --user https://github.com/folgerwang/SiCode/releases/down
 export PATH="$HOME/Library/Python/$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')/bin:$PATH"
 sicode --download-model
 cd your-project
-sicode                         # terminal CLI (Alt+V pastes clipboard image/video)
+sicode                         # terminal CLI (Alt+V pastes clipboard image/video/audio)
 sicode --web                   # browser UI
 ```
 

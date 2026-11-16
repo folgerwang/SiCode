@@ -195,11 +195,11 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
   <div id="scroll"><div id="feed"></div></div>
   <div id="compose">
     <div id="box">
-      <textarea id="text" rows="1" placeholder="Describe a task, or ask about this folder (paste or drop images/videos)"></textarea>
+      <textarea id="text" rows="1" placeholder="Describe a task, or ask about this folder (paste or drop images, videos or audio)"></textarea>
       <div id="mediaprev" style="display:none;flex-wrap:wrap;gap:6px;padding:0 12px 6px"></div>
       <div id="bar">
-        <button id="attach" class="ghost" title="Attach image or video">+ Media</button>
-        <input type="file" id="mediafile" accept="image/*,video/*" multiple hidden>
+        <button id="attach" class="ghost" title="Attach image, video or audio">+ Media</button>
+        <input type="file" id="mediafile" accept="image/*,video/*,audio/*,.mp3,.wav,.m4a,.aac,.flac,.ogg,.opus,.wma" multiple hidden>
         <select id="mode" title="Permissions"></select>
         <div id="alloc" title="Cloud AI share for this project (0% = Local only, 100% = Cloud only & unload local model)" style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);margin-left:4px">
           <span>Cloud</span><input type="range" id="cloudmix" min="0" max="100" step="5" value="10" style="width:96px;accent-color:var(--accent)"><b id="cloudmixv" style="color:var(--text);min-width:34px">10%</b><span id="allocmode" class="dim"></span>
@@ -210,7 +210,7 @@ dialog input[type=text], dialog input[type=password], dialog select { width: 100
         <button id="send" class="primary">Send</button>
       </div>
     </div>
-    <div id="hint">Enter sends, Shift+Enter adds a line. @path attaches a file; Alt+V / Ctrl+V pastes image or video.</div>
+    <div id="hint">Enter sends, Shift+Enter adds a line. @path attaches a file; Alt+V / Ctrl+V pastes image, video or audio.</div>
   </div>
 </main>
 
@@ -344,7 +344,7 @@ function view(it) {
     const b = el('div', 'user', it.text);
     if (it.media && it.media.length) {
       const mr = el('div'); mr.style.cssText = 'display:flex;flex-wrap:wrap;gap:6px;margin-top:6px';
-      for (const m of it.media) mr.append(el('span', 'chip', (m.mime && m.mime.startsWith('video/') ? '🎬 ' : '🖼 ') + (m.name || m.rel)));
+      for (const m of it.media) mr.append(el('span', 'chip', mediaIcon(m.mime) + ' ' + (m.name || m.rel)));
       b.append(mr);
     }
     if (it.route === 'hybrid' || it.route === 'claude') b.append(el('span', 'via', 'mix: steps marked [l] run on the local model, [c] in the cloud'));
@@ -692,7 +692,7 @@ function renderMediaPrev() {
       img.style.cssText = 'width:24px;height:24px;object-fit:cover;border-radius:4px';
       chip.append(img);
     } else {
-      chip.append(el('span', '', '🎬'));
+      chip.append(el('span', '', mediaIcon(m.mime)));
     }
     const rm = el('button', 'ghost', '×'); rm.style.padding = '0 4px';
     rm.onclick = () => { pendingMedia.splice(idx, 1); renderMediaPrev(); };
@@ -700,11 +700,20 @@ function renderMediaPrev() {
     box.append(chip);
   });
 }
+// audio files the browser may hand over without a type (it goes by the system's registry)
+const AUDIO_EXTS = {mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac',
+                    ogg: 'audio/ogg', opus: 'audio/ogg', wma: 'audio/x-ms-wma'};
+function mediaIcon(mime) {
+  return mime && mime.startsWith('video/') ? '🎬' : mime && mime.startsWith('audio/') ? '🎵' : '🖼';
+}
 function addMediaFiles(files) {
   for (const f of files) {
-    if (!f || (!f.type.startsWith('image/') && !f.type.startsWith('video/'))) continue;
+    if (!f) continue;
+    const ext = (f.name || '').split('.').pop().toLowerCase();
+    const mime = /^(image|video|audio)\//.test(f.type) ? f.type : AUDIO_EXTS[ext];
+    if (!mime) continue;
     const rd = new FileReader();
-    rd.onload = () => { pendingMedia.push({name: f.name || 'pasted', mime: f.type, data_b64: rd.result}); renderMediaPrev(); };
+    rd.onload = () => { pendingMedia.push({name: f.name || 'pasted', mime, data_b64: rd.result}); renderMediaPrev(); };
     rd.readAsDataURL(f);
   }
 }
