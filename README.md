@@ -1,6 +1,6 @@
 # SiCode
 
-![SiCode v0.2.3 Web UI working environment](docs/sicode-webui.jpg)
+![SiCode v0.2.4 Web UI working environment](docs/sicode-webui.jpg)
 
 From-scratch C++ inference engine for Qwen MoE models (CPU AVX-512 + hand-written Vulkan compute shaders, no ML libraries).
 
@@ -19,9 +19,9 @@ Codex) or with a Claude API key.
 
 | Platform | Wheel | Install |
 |---|---|---|
-| **Windows (x64)** | [sicode-0.2.3-py3-none-win_amd64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.3/sicode-0.2.3-py3-none-win_amd64.whl) | `pip install sicode-0.2.3-py3-none-win_amd64.whl` |
-| **Linux (x86_64)** | [sicode-0.2.3-py3-none-manylinux_2_28_x86_64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.3/sicode-0.2.3-py3-none-manylinux_2_28_x86_64.whl) | `pip install sicode-0.2.3-py3-none-manylinux_2_28_x86_64.whl` |
-| **macOS (Apple Silicon)** | [sicode-0.2.3-py3-none-macosx_11_0_arm64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.3/sicode-0.2.3-py3-none-macosx_11_0_arm64.whl) | `pip install sicode-0.2.3-py3-none-macosx_11_0_arm64.whl` |
+| **Windows (x64)** | [sicode-0.2.4-py3-none-win_amd64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.4/sicode-0.2.4-py3-none-win_amd64.whl) | `pip install sicode-0.2.4-py3-none-win_amd64.whl` |
+| **Linux (x86_64)** | [sicode-0.2.4-py3-none-manylinux_2_28_x86_64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.4/sicode-0.2.4-py3-none-manylinux_2_28_x86_64.whl) | `pip install sicode-0.2.4-py3-none-manylinux_2_28_x86_64.whl` |
+| **macOS (Apple Silicon)** | [sicode-0.2.4-py3-none-macosx_11_0_arm64.whl](https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.4/sicode-0.2.4-py3-none-macosx_11_0_arm64.whl) | `pip install sicode-0.2.4-py3-none-macosx_11_0_arm64.whl` |
 
 ### CLI Installation Guide (Windows / Linux / macOS)
 
@@ -29,7 +29,7 @@ Requires **Python 3.10+** (if `sicode` is not on `PATH` after `pip install`, run
 
 **Windows (x64, PowerShell / CMD):**
 ```powershell
-pip install https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.3/sicode-0.2.3-py3-none-win_amd64.whl
+pip install https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.4/sicode-0.2.4-py3-none-win_amd64.whl
 sicode --download-model        # optional: local model (~115 GB) to ~/.sicode/models
 cd your-project
 sicode                         # terminal CLI (Alt+V pastes clipboard image/video)
@@ -39,7 +39,7 @@ sicode --web                   # browser UI
 
 **Linux (x86_64):**
 ```bash
-python3 -m pip install --user https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.3/sicode-0.2.3-py3-none-manylinux_2_28_x86_64.whl
+python3 -m pip install --user https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.4/sicode-0.2.4-py3-none-manylinux_2_28_x86_64.whl
 export PATH="$HOME/.local/bin:$PATH"
 sicode --download-model
 cd your-project
@@ -49,7 +49,7 @@ sicode --web                   # browser UI
 
 **macOS (Apple Silicon arm64):**
 ```bash
-python3 -m pip install --user https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.3/sicode-0.2.3-py3-none-macosx_11_0_arm64.whl
+python3 -m pip install --user https://github.com/folgerwang/SiCode/releases/download/sicode-v0.2.4/sicode-0.2.4-py3-none-macosx_11_0_arm64.whl
 export PATH="$HOME/Library/Python/$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")')/bin:$PATH"
 sicode --download-model
 cd your-project

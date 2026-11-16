@@ -15,7 +15,7 @@ Each request runs in one of three modes: **local** (the local model alone), **cl
 On 64-bit Windows, from the wheel on the [releases page](https://github.com/folgerwang/SiCode/releases):
 
 ```
-pip install sicode-0.2.3-py3-none-win_amd64.whl
+pip install sicode-0.2.4-py3-none-win_amd64.whl
 sicode --download-model
 ```
 
