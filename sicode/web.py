@@ -660,8 +660,16 @@ class Web:
                 self.update(note, status="done")
                 return
             if action == "stop":
-                self.update(note, status="done", text=f"Cloud monitor: STOP — {reason}")
-                self.force_stop(task.id)
+                restarts = int((cur_ctx or {}).get("restarts", 0))
+                done_ev.set()
+                if restarts < 3:
+                    self.update(note, status="done",
+                                text=f"Cloud monitor: lock detected ({reason}) — restarting & continuing ({restarts + 1}/3) ...")
+                    self.force_stop(task.id)
+                    self._start_work(task, request_text, "local", restarts=restarts + 1)
+                else:
+                    self.update(note, status="done", text=f"Cloud monitor: STOP — {reason} (max auto-restarts reached)")
+                    self.force_stop(task.id)
                 return
             self.update(note, status="done", text=f"Cloud monitor: WAIT — {reason}")
 
@@ -1119,7 +1127,7 @@ class Web:
                     self.active.pop(task.id, None)
             self.push_state()
 
-    def _start_work(self, task, text, route, media=None):
+    def _start_work(self, task, text, route, media=None, restarts=0):
         with self.lock:
             if task.id in self.active:
                 return False
@@ -1128,7 +1136,7 @@ class Web:
             run_ctx = {
                 "task": task, "ws": None, "stop": False, "run_id": rid,
                 "cmd_item": None, "tool_item": None, "sub": False, "by": "",
-                "planner_chat": None, "monitor_chat": None,
+                "planner_chat": None, "monitor_chat": None, "restarts": restarts,
             }
             self.active[task.id] = run_ctx
             task.started = time.time()
