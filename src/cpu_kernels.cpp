@@ -33,6 +33,33 @@ float half_to_f32(uint16_t h) {
     return f;
 }
 
+static inline uint16_t f32_to_f16_scalar(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int exp = (int)((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        return (uint16_t)(sign | (mant >> (14 - exp)));
+    }
+    if (exp >= 31) return (uint16_t)(sign | 0x7BFFu);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | ((mant + 0x1000u) >> 13));
+}
+
+void f32_to_f16_vec(const float* src, uint16_t* dst, size_t n) {
+    size_t i = 0;
+#ifdef QW_AVX512
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_loadu_ps(src + i);
+        __m256i h = _mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), h);
+    }
+#endif
+    for (; i < n; i++) dst[i] = f32_to_f16_scalar(src[i]);
+}
+
 struct Fp8Lut {
     float v[256];
     Fp8Lut() {

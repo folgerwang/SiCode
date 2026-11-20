@@ -28,6 +28,7 @@ void run_jobs(ThreadPool& pool, const std::vector<MatJob>& jobs);
 
 float dot_f32(const float* a, const float* b, int n);
 float half_to_f32(uint16_t h);
+void f32_to_f16_vec(const float* src, uint16_t* dst, size_t n);
 // Y[t, r0 + i] for i < nr (<= 4), all n tokens, from nr dequantized rows w[i * cols].
 void gemm_block(const float* w, int nr, const float* x, int n, int cols, float* y, int rows, int r0);
 void axpy(float* out, float p, const float* v, int n);  // out += p * v

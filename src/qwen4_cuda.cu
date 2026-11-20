@@ -408,8 +408,100 @@ __global__ void q4_matmul_q8_dp4a_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint6
     }
 }
 
+template <Codec C>
+__global__ void q4_matmul_wide_kernel(uint64_t w1, uint64_t s1, uint64_t x_ptr, uint64_t y_ptr, uint32_t rows,
+                                      uint32_t cols, uint32_t n, uint32_t x_stride, uint32_t y_stride, uint32_t post,
+                                      float post_scale) {
+    __shared__ float red[NT][8];
+    const uint32_t tid = threadIdx.x, sg = tid >> 5, lane = tid & 31u;
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const uint32_t chunks = cols / 16u;
+    const uint32_t t0 = blockIdx.y * NT;
+    const uint32_t nt = min((uint32_t)NT, n - t0);
+
+    float acc[NT];
+#pragma unroll
+    for (uint32_t t = 0; t < NT; t++) acc[t] = 0.0f;
+
+    for (uint32_t c = tid; c < chunks; c += 256u) {
+        float4 a0, a1, a2, a3;
+        decode8<C>(w1, s1, cols, row, c * 2u, a0, a1);
+        decode8<C>(w1, s1, cols, row, c * 2u + 1u, a2, a3);
+#pragma unroll
+        for (uint32_t t = 0; t < NT; t++) {
+            if (t >= nt) break;
+            const float4* xs = reinterpret_cast<const float4*>(x_ptr + (uint64_t)(t0 + t) * x_stride * 4u);
+            const float4 x0 = xs[c * 4u], x1 = xs[c * 4u + 1u], x2 = xs[c * 4u + 2u], x3 = xs[c * 4u + 3u];
+            acc[t] += f4_dot(a0, x0) + f4_dot(a1, x1) + f4_dot(a2, x2) + f4_dot(a3, x3);
+        }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < NT; t++) {
+        if (t >= nt) break;
+        const float r = warp_sum(acc[t]);
+        if (lane == 0u) red[t][sg] = r;
+    }
+    __syncthreads();
+    if (sg == 0u && lane < nt) {
+        float tot = 0.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) tot += red[lane][i];
+        if (post == 1u) tot = d_silu(tot * post_scale);
+        reinterpret_cast<float*>(y_ptr + (uint64_t)(t0 + lane) * y_stride * 4u)[row] = tot;
+    }
+}
+
+__global__ void q4_matmul_wide_q8_dp4a_kernel(uint64_t w1, uint64_t s1, const int8_t* xq, const float* xs,
+                                              uint64_t y_ptr, uint32_t rows, uint32_t cols, uint32_t nt,
+                                              uint32_t y_stride, uint32_t post, float post_scale) {
+    __shared__ float red[NT][8];
+    const uint32_t tid = threadIdx.x, sg = tid >> 5, lane = tid & 31u;
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const uint32_t nblk = cols >> 5;
+    const int4* W1 = reinterpret_cast<const int4*>(w1) + (uint64_t)row * (cols >> 4);
+    const float* S1 = reinterpret_cast<const float*>(s1) + (uint64_t)row * nblk;
+
+    float acc[NT];
+#pragma unroll
+    for (uint32_t t = 0; t < NT; t++) acc[t] = 0.0f;
+
+    for (uint32_t b = tid; b < nblk; b += 256u) {
+        const int4 w1a = W1[b * 2u], w1b = W1[b * 2u + 1u];
+        const float sc1 = S1[b];
+#pragma unroll
+        for (uint32_t t = 0; t < NT; t++) {
+            if (t >= nt) break;
+            const int4* X = reinterpret_cast<const int4*>(xq + (uint64_t)t * cols);
+            const int4 xa = X[b * 2u], xb = X[b * 2u + 1u];
+            const float xsc = xs[(uint64_t)t * nblk + b];
+            int s = 0;
+            s = __dp4a(w1a.x, xa.x, s); s = __dp4a(w1a.y, xa.y, s);
+            s = __dp4a(w1a.z, xa.z, s); s = __dp4a(w1a.w, xa.w, s);
+            s = __dp4a(w1b.x, xb.x, s); s = __dp4a(w1b.y, xb.y, s);
+            s = __dp4a(w1b.z, xb.z, s); s = __dp4a(w1b.w, xb.w, s);
+            acc[t] = fmaf((float)s, sc1 * xsc, acc[t]);
+        }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < NT; t++) {
+        if (t >= nt) break;
+        const float r = warp_sum(acc[t]);
+        if (lane == 0u) red[t][sg] = r;
+    }
+    __syncthreads();
+    if (sg == 0u && lane < nt) {
+        float tot = 0.0f;
+#pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) tot += red[lane][i];
+        if (post == 1u) tot = d_silu(tot * post_scale);
+        reinterpret_cast<float*>(y_ptr + (uint64_t)lane * y_stride * 4u)[row] = tot;
+    }
+}
+
 // =============================================================================================
-// Tensor Core WMMA GEMM kernel (64x64x32, 8 warps = 256 threads, FP16xFP16 -> FP32)
+// Tensor Core WMMA GEMM kernel (64x64x32, 8 warps = 256 threads, pure-FP16 smem, 2 blocks/SM)
 // =============================================================================================
 template <Codec C, bool Expert, bool SwiGLU>
 __global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a2_ptr, uint64_t a3_ptr,
@@ -421,8 +513,7 @@ __global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a
     __shared__ __half Ws[BM * LDA];
     __shared__ __half Ws2[SwiGLU ? BM * LDA : 1];
     __shared__ __half Xs[BN * LDA];
-    __shared__ __half Xl[BN * LDA];  // hi + lo fp16 pair for ~fp32 activation accuracy
-    __shared__ float Cs[BN * LDC];
+    __shared__ float Cs[32 * LDC];  // 18.5 KB dense / 23.5 KB SWIGLU -> 2 blocks/SM in 48 KB
 
     const uint32_t tid = threadIdx.x, sg = tid >> 5;
     const uint32_t r0 = blockIdx.x * BM;
@@ -459,7 +550,7 @@ __global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a
     const uint32_t wrow = r0 + lr;
     const float4* xs = reinterpret_cast<const float4*>(x_ptr + (uint64_t)xrow * x_stride * 4u);
 
-    const uint32_t rb = sg >> 1, tb0 = (sg & 1u) * 2u;
+    const uint32_t rb = sg >> 1, tb_half = sg & 1u, tb0 = tb_half * 2u;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2], acc2[2];
 #pragma unroll
     for (int j = 0; j < 2; j++) {
@@ -470,17 +561,6 @@ __global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a
     auto store_h8 = [](__half* dst, float4 a, float4 b) {
         dst[0] = __float2half(a.x); dst[1] = __float2half(a.y); dst[2] = __float2half(a.z); dst[3] = __float2half(a.w);
         dst[4] = __float2half(b.x); dst[5] = __float2half(b.y); dst[6] = __float2half(b.z); dst[7] = __float2half(b.w);
-    };
-    auto split_h = [](float v, __half& hi, __half& lo) {
-        const float h = __uint_as_float(__float_as_uint(v) & 0xFFFFE000u);
-        hi = __float2half(h);
-        lo = __float2half(v - h);
-    };
-    auto store_x8 = [&](uint32_t base, float4 a, float4 b) {
-        split_h(a.x, Xs[base + 0], Xl[base + 0]); split_h(a.y, Xs[base + 1], Xl[base + 1]);
-        split_h(a.z, Xs[base + 2], Xl[base + 2]); split_h(a.w, Xs[base + 3], Xl[base + 3]);
-        split_h(b.x, Xs[base + 4], Xl[base + 4]); split_h(b.y, Xs[base + 5], Xl[base + 5]);
-        split_h(b.z, Xs[base + 6], Xl[base + 6]); split_h(b.w, Xs[base + 7], Xl[base + 7]);
     };
 
     for (uint32_t k0 = 0; k0 < cols; k0 += BK) {
@@ -497,7 +577,7 @@ __global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a
             x0 = xs[(k0 + lk) / 4u];
             x1 = xs[(k0 + lk) / 4u + 1u];
         }
-        store_x8(lr * LDA + lk, x0, x1);
+        store_h8(&Xs[lr * LDA + lk], x0, x1);
         __syncthreads();
 
 #pragma unroll
@@ -507,38 +587,34 @@ __global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a
             if constexpr (SwiGLU) wmma::load_matrix_sync(fa2, &Ws2[rb * 16u * LDA + kk], LDA);
 #pragma unroll
             for (int j = 0; j < 2; j++) {
-                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb, fbl;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
                 wmma::load_matrix_sync(fb, &Xs[(tb0 + j) * 16u * LDA + kk], LDA);
-                wmma::load_matrix_sync(fbl, &Xl[(tb0 + j) * 16u * LDA + kk], LDA);
                 wmma::mma_sync(acc[j], fa, fb, acc[j]);
-                wmma::mma_sync(acc[j], fa, fbl, acc[j]);
-                if constexpr (SwiGLU) {
-                    wmma::mma_sync(acc2[j], fa2, fb, acc2[j]);
-                    wmma::mma_sync(acc2[j], fa2, fbl, acc2[j]);
-                }
+                if constexpr (SwiGLU) wmma::mma_sync(acc2[j], fa2, fb, acc2[j]);
             }
         }
         __syncthreads();
     }
 
 #pragma unroll
-    for (int j = 0; j < 2; j++) {
+    for (uint32_t j = 0; j < 2u; j++) {
         if constexpr (SwiGLU) {
             for (int i = 0; i < acc[j].num_elements; i++) acc[j].x[i] = d_silu(acc[j].x[i]) * acc2[j].x[i];
         }
-        wmma::store_matrix_sync(&Cs[(tb0 + j) * 16u * LDC + rb * 16u], acc[j], LDC, wmma::mem_col_major);
-    }
-    __syncthreads();
-
-    for (uint32_t i = tid; i < BM * BN; i += 256u) {
-        const uint32_t t = i / BM, r = i % BM;
-        if (t < ntok) {
-            float v = Cs[t * LDC + r];
-            if constexpr (!Expert) {
-                if (post == 1u) v = d_silu(v * post_scale);
+        wmma::store_matrix_sync(&Cs[tb_half * 16u * LDC + rb * 16u], acc[j], LDC, wmma::mem_col_major);
+        __syncthreads();
+        for (uint32_t i = tid; i < BM * 32u; i += 256u) {
+            const uint32_t lt = i / BM, r = i % BM;
+            const uint32_t t = (lt < 16u) ? (lt + j * 16u) : (32u + (lt - 16u) + j * 16u);
+            if (t < ntok) {
+                float v = Cs[lt * LDC + r];
+                if constexpr (!Expert) {
+                    if (post == 1u) v = d_silu(v * post_scale);
+                }
+                reinterpret_cast<float*>(y_ptr + (uint64_t)(out0 + t) * y_stride * 4u)[r0 + r] = v;
             }
-            reinterpret_cast<float*>(y_ptr + (uint64_t)(out0 + t) * y_stride * 4u)[r0 + r] = v;
         }
+        __syncthreads();
     }
 }
 
@@ -1123,22 +1199,23 @@ __global__ void moe_route_kernel(const float* logits, uint32_t* sel, float* selw
     }
 }
 
-__global__ void comb_weights_kernel(uint32_t* comb, const float* selw, uint32_t n) {
-    const uint32_t i = blockIdx.x * 256u + threadIdx.x;
-    if (i >= n) return;
-    comb[2u * i + 1u] = __float_as_uint(selw[i]);
-}
-
-__global__ void moe_combine_set_kernel(float* x, const float* sgate, const float* sy, const float* ey,
-                                       const uint32_t* table, uint32_t dim, uint32_t top_k) {
+__global__ void moe_combine_hc_kernel(float* x, const float* inj, const float* sgate, const float* sy,
+                                      const float* ey, const __half* cy16, const uint32_t* row_ids, const float* selw,
+                                      uint32_t dim, uint32_t hc, uint32_t top_k, uint32_t gpu_rows) {
     const uint32_t d = blockIdx.x * 256u + threadIdx.x, t = blockIdx.y;
     if (d >= dim) return;
-    float acc = d_sigmoid(sgate[t]) * sy[(uint64_t)t * dim + d];
+    float blk = d_sigmoid(sgate[t]) * sy[(uint64_t)t * dim + d];
+    const uint32_t base = t * top_k;
     for (uint32_t k = 0; k < top_k; k++) {
-        const uint32_t e = (t * top_k + k) * 2u;
-        acc += __uint_as_float(table[e + 1u]) * ey[(uint64_t)table[e] * dim + d];
+        const uint32_t r = row_ids[base + k];
+        const float w = selw[base + k];
+        const float v = (r < gpu_rows) ? ey[(uint64_t)r * dim + d]
+                                       : __half2float(cy16[(uint64_t)(r - gpu_rows) * dim + d]);
+        blk += w * v;
     }
-    x[(uint64_t)t * dim + d] = acc;
+    float* xr = x + (uint64_t)t * hc * dim;
+    for (uint32_t s = 0; s < hc; s++)
+        xr[s * dim + d] += 2.0f * d_sigmoid(inj[t * hc + s] / (float)hc) * blk;
 }
 
 // =============================================================================================
@@ -1636,9 +1713,10 @@ private:
         sgate_ = act(NMAX);
         act_ = act((size_t)NMAX * TK * c_.moe_inter);
         ey_ = act((size_t)NMAX * TK * H);
+        cy16_ = arena_.alloc((size_t)NMAX * TK * H * 2);
         rlogits_ = act((size_t)NMAX * c_.n_experts);
         selw_ = act((size_t)NMAX * TK);
-        comb_ = act((size_t)NMAX * TK * 2);
+        comb_ = arena_.alloc((size_t)NMAX * TK * 4);
         sel_ = arena_.alloc((size_t)NMAX * TK * 4);
         logits_ = arena_.alloc((size_t)c_.vocab * 4 * (draft_ + 1));
         dmask_ = arena_.alloc((size_t)NMAX * mask_words_ * 4);
@@ -1698,8 +1776,8 @@ private:
         hemb_ = host_alloc((size_t)NMAX * H * 4);
         hsel_ = host_alloc((size_t)NMAX * TK * 4);
         hxn_ = host_alloc((size_t)NMAX * H * 4);
-        hcy_ = host_alloc((size_t)NMAX * TK * H * 4);
-        htab_ = host_alloc(htab_comb_ + ne * 8);
+        hcy_ = host_alloc((size_t)NMAX * TK * H * 2);
+        htab_ = host_alloc(htab_comb_ + ne * 4);
         hlog_ = host_alloc((size_t)c_.vocab * 4 * (draft_ + 1));
         hqsa_ = host_alloc(std::max<size_t>((size_t)n_qsa * NMAX * H * 4, 256));
         hmask_ = host_alloc((size_t)NMAX * mask_words_ * 4);
@@ -1949,7 +2027,17 @@ private:
     }
 
     // ---- kernel launch wrappers ---------------------------------------------------------------
+    void ensure_qx(uint64_t x, int n, int cols, int x_stride) {
+        if (!use_graph_ && qx_valid_ && qx_x_ == x && qx_n_ == n && qx_cols_ == cols && qx_stride_ == x_stride) return;
+        quantize_x_q8_kernel<<<dim3(cols >> 5, n), 32, 0, stream_>>>(
+            reinterpret_cast<const float*>(x), reinterpret_cast<int8_t*>(xq_), reinterpret_cast<float*>(xs_),
+            cols, x_stride);
+        qx_valid_ = true;
+        qx_x_ = x; qx_n_ = n; qx_cols_ = cols; qx_stride_ = x_stride;
+    }
+
     void mat(const CM& m, uint64_t x, uint64_t y, int n, int x_stride, uint32_t post = 0, float post_scale = 0.0f) {
+        if (y == qx_x_) qx_valid_ = false;
         if (n >= GEMM_MIN && m.rows % 64 == 0) {
             dim3 grid(groups(m.rows, 64), groups(n, 64));
             if (m.q8)
@@ -1959,13 +2047,25 @@ private:
                 q4_gemm_wmma_kernel<Codec::F32, false, false><<<grid, 256, 0, stream_>>>(
                     m.w, 0, 0, 0, x, y, 0, 0, 0, 0, m.rows, m.cols, n, x_stride, m.rows, post, post_scale);
         } else if (use_dp4a_ && m.q8 && n <= NT) {
-            quantize_x_q8_kernel<<<dim3(m.cols >> 5, n), 32, 0, stream_>>>(
-                reinterpret_cast<const float*>(x), reinterpret_cast<int8_t*>(xq_), reinterpret_cast<float*>(xs_),
-                m.cols, x_stride);
-            dim3 grid(groups(m.rows, 8), 1);
-            q4_matmul_q8_dp4a_kernel<false, false><<<grid, 256, 0, stream_>>>(
-                m.w, m.s, 0, 0, reinterpret_cast<const int8_t*>(xq_), reinterpret_cast<const float*>(xs_), y, 0, 0, 0, 0,
-                m.rows, m.cols, n, m.rows, post, post_scale);
+            ensure_qx(x, n, m.cols, x_stride);
+            if (m.rows <= 256 && m.cols >= 2048) {
+                q4_matmul_wide_q8_dp4a_kernel<<<m.rows, 256, 0, stream_>>>(
+                    m.w, m.s, reinterpret_cast<const int8_t*>(xq_), reinterpret_cast<const float*>(xs_), y,
+                    m.rows, m.cols, n, m.rows, post, post_scale);
+            } else {
+                dim3 grid(groups(m.rows, 8), 1);
+                q4_matmul_q8_dp4a_kernel<false, false><<<grid, 256, 0, stream_>>>(
+                    m.w, m.s, 0, 0, reinterpret_cast<const int8_t*>(xq_), reinterpret_cast<const float*>(xs_), y, 0, 0,
+                    0, 0, m.rows, m.cols, n, m.rows, post, post_scale);
+            }
+        } else if (m.rows <= 256 && m.cols >= 2048) {
+            dim3 grid(m.rows, groups(n, NT));
+            if (m.q8)
+                q4_matmul_wide_kernel<Codec::Q8><<<grid, 256, 0, stream_>>>(
+                    m.w, m.s, x, y, m.rows, m.cols, n, x_stride, m.rows, post, post_scale);
+            else
+                q4_matmul_wide_kernel<Codec::F32><<<grid, 256, 0, stream_>>>(
+                    m.w, 0, x, y, m.rows, m.cols, n, x_stride, m.rows, post, post_scale);
         } else {
             dim3 grid(groups(m.rows, 8), groups(n, NT));
             if (m.q8)
@@ -1978,6 +2078,7 @@ private:
     }
 
     void mat_swiglu(const CM& g, const CM& u, uint64_t x, uint64_t y, int n) {
+        if (y == qx_x_) qx_valid_ = false;
         if (n >= GEMM_MIN && g.rows % 64 == 0) {
             dim3 grid(groups(g.rows, 64), groups(n, 64));
             if (g.q8)
@@ -1987,9 +2088,7 @@ private:
                 q4_gemm_wmma_kernel<Codec::F32, false, true><<<grid, 256, 0, stream_>>>(
                     g.w, 0, u.w, 0, x, y, 0, 0, 0, 0, g.rows, g.cols, n, g.cols, g.rows, 0, 0.0f);
         } else if (use_dp4a_ && g.q8 && n <= NT) {
-            quantize_x_q8_kernel<<<dim3(g.cols >> 5, n), 32, 0, stream_>>>(
-                reinterpret_cast<const float*>(x), reinterpret_cast<int8_t*>(xq_), reinterpret_cast<float*>(xs_),
-                g.cols, g.cols);
+            ensure_qx(x, n, g.cols, g.cols);
             dim3 grid(groups(g.rows, 8), 1);
             q4_matmul_q8_dp4a_kernel<false, true><<<grid, 256, 0, stream_>>>(
                 g.w, g.s, u.w, u.s, reinterpret_cast<const int8_t*>(xq_), reinterpret_cast<const float*>(xs_), y, 0, 0,
@@ -2030,16 +2129,19 @@ private:
     }
 
     void hc_mix(const CHc& h, uint64_t x, int n) {
+        qx_valid_ = false;
         const int H = c_.hidden, HC = c_.hc_dim();
         q4_hc_norm_kernel<<<dim3(n, c_.hc), 256, 0, stream_>>>(
             reinterpret_cast<const float*>(x), reinterpret_cast<const float*>(h.norm),
             reinterpret_cast<float*>(xnorm_), H, c_.hc, c_.rms_eps);
         mat(h.down, xnorm_, lo_, n, HC, 1, 1.0f / c_.hc);
         if (h.has_inject) mat(h.inject, xnorm_, inj_, n, HC);
+        qx_valid_ = false;
         mat(h.up, lo_, gate_, n, c_.hc_rank);
         q4_hc_mix_kernel<<<dim3(groups(H, 256), n), 256, 0, stream_>>>(
             reinterpret_cast<const float*>(xnorm_), reinterpret_cast<const float*>(gate_),
             reinterpret_cast<float*>(xn_), H, c_.hc);
+        qx_valid_ = false;
     }
 
     void hc_combine(uint64_t x, int n) {
@@ -2049,6 +2151,7 @@ private:
     }
 
     void ple(int l, int n) {
+        qx_valid_ = false;
         const CLayer& g = L_[l];
         const int H = c_.hidden, HC = c_.hc_dim();
         const size_t hb = (size_t)ple_hist_ * HC * 4;
@@ -2106,6 +2209,7 @@ private:
         gated_norm_sigmoid_kernel<<<dim3(n, c_.lin_v_heads), 128, 0, stream_>>>(
             reinterpret_cast<float*>(core_), reinterpret_cast<const float*>(z_),
             reinterpret_cast<const float*>(g.lnorm), c_.lin_v_heads, c_.rms_eps);
+        qx_valid_ = false;
         mat(g.out, core_, mix_, n, c_.lin_value_dim());
     }
 
@@ -2181,6 +2285,7 @@ private:
         attn_combine_kernel<<<dim3(n, c_.n_heads), 256, 0, stream_>>>(
             reinterpret_cast<const float*>(part_), reinterpret_cast<const float*>(qg_), reinterpret_cast<float*>(att_),
             c_.n_heads, splits);
+        qx_valid_ = false;
         mat(g.o, att_, mix_, n, AD);
     }
 
@@ -2194,7 +2299,7 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(hxn_, reinterpret_cast<void*>(xn_), (size_t)n * H * 4, cudaMemcpyDeviceToHost, stream_));
     }
 
-    void moe(int l, int n, bool route_already_queued = false) {
+    void moe(int l, int n, uint64_t x_addr, bool route_already_queued = false) {
         const CLayer& g = L_[l];
         const Q4Layer& W = w_.layers[l];
         const int H = c_.hidden, TK = c_.top_k, E = c_.n_experts, I = c_.moe_inter;
@@ -2208,11 +2313,13 @@ private:
             run_graph(shared_graphs_, skey, [&] {
                 mat(g.sgate, xn_, sgate_, n, H);
                 mat_swiglu(g.sh_gate, g.sh_up, xn_, sact_, n);
+                qx_valid_ = false;
                 mat(g.sh_down, sact_, sy_, n, c_.shared_inter);
             });
         } else {
             mat(g.sgate, xn_, sgate_, n, H);
             mat_swiglu(g.sh_gate, g.sh_up, xn_, sact_, n);
+            qx_valid_ = false;
             mat(g.sh_down, sact_, sy_, n, c_.shared_inter);
         }
 
@@ -2260,7 +2367,7 @@ private:
                 for (uint32_t j = 0; j < cnt; j++) {
                     const int i = per_[e][i0 + j];
                     toks[row + j] = (uint32_t)(i / TK);
-                    comb[2 * i] = row + j;
+                    comb[i] = row + j;
                 }
                 row += cnt;
             }
@@ -2283,15 +2390,15 @@ private:
                                    H, I, I, H, 1, ne);
         }
 
-        // CPU: compute uncached experts directly from mmapped GGUF
+        // CPU: compute uncached experts directly from mmapped GGUF; pack output to fp16 for 2x less PCIe traffic
         size_t rows_cpu = 0;
         for (int e : cpu_experts_) rows_cpu += per_[e].size();
         if (rows_cpu) {
             const float* xn = reinterpret_cast<const float*>(hxn_);
-            float* cy = reinterpret_cast<float*>(hcy_);
             cg_.resize(rows_cpu * I);
             cu_.resize(rows_cpu * I);
             cx_.resize(rows_cpu * H);
+            cy_f32_.resize(rows_cpu * H);
             cmats_.resize(cpu_experts_.size() * 3);
             std::vector<gq::Job> jobs;
             size_t r = 0;
@@ -2306,7 +2413,7 @@ private:
                         std::memcpy(&cx_[(r + j) * H], xn + (size_t)(per_[e][j] / TK) * H, (size_t)H * 4);
                     x = &cx_[r * H];
                 }
-                for (int j = 0; j < cnt; j++) comb[2 * per_[e][j]] = gpu_rows + (uint32_t)(r + j);
+                for (int j = 0; j < cnt; j++) comb[per_[e][j]] = gpu_rows + (uint32_t)(r + j);
                 jobs.push_back({&cmats_[a * 3], x, &cg_[r * I], cnt});
                 jobs.push_back({&cmats_[a * 3 + 1], x, &cu_[r * I], cnt});
                 r += cnt;
@@ -2319,24 +2426,29 @@ private:
             r = 0;
             for (size_t a = 0; a < cpu_experts_.size(); a++) {
                 const int cnt = (int)per_[cpu_experts_[a]].size();
-                jobs.push_back({&cmats_[a * 3 + 2], &cg_[r * I], cy + r * H, cnt});
+                jobs.push_back({&cmats_[a * 3 + 2], &cg_[r * I], cy_f32_.data() + r * H, cnt});
                 r += cnt;
             }
             gq::run_jobs(cpu_, jobs);
+            uint16_t* cy16 = reinterpret_cast<uint16_t*>(hcy_);
+            cpu_.parallel_for((int64_t)rows_cpu, [&](int64_t b, int64_t e2) {
+                ck::f32_to_f16_vec(cy_f32_.data() + (size_t)b * H, cy16 + (size_t)b * H, (size_t)(e2 - b) * H);
+            }, 1);
         }
         t_gpu_ += std::chrono::duration<double>(tp1 - tp0).count();
         t_cpu_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp1).count();
 
         if (rows_cpu)
-            CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(ey_) + (size_t)gpu_rows * H * 4, hcy_,
-                                       (size_t)rows_cpu * H * 4, cudaMemcpyHostToDevice, stream_));
-        CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(comb_), htab_ + htab_comb_, (size_t)n * TK * 8,
+            CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(cy16_), hcy_, (size_t)rows_cpu * H * 2,
+                                       cudaMemcpyHostToDevice, stream_));
+        CUDA_CHECK(cudaMemcpyAsync(reinterpret_cast<void*>(comb_), htab_ + htab_comb_, (size_t)n * TK * 4,
                                    cudaMemcpyHostToDevice, stream_));
-        comb_weights_kernel<<<groups(n * TK, 256), 256, 0, stream_>>>(
-            reinterpret_cast<uint32_t*>(comb_), reinterpret_cast<const float*>(selw_), n * TK);
-        moe_combine_set_kernel<<<dim3(groups(H, 256), n), 256, 0, stream_>>>(
-            reinterpret_cast<float*>(mix_), reinterpret_cast<const float*>(sgate_), reinterpret_cast<const float*>(sy_),
-            reinterpret_cast<const float*>(ey_), reinterpret_cast<const uint32_t*>(comb_), H, TK);
+        moe_combine_hc_kernel<<<dim3(groups(H, 256), n), 256, 0, stream_>>>(
+            reinterpret_cast<float*>(x_addr), reinterpret_cast<const float*>(inj_),
+            reinterpret_cast<const float*>(sgate_), reinterpret_cast<const float*>(sy_),
+            reinterpret_cast<const float*>(ey_), reinterpret_cast<const __half*>(cy16_),
+            reinterpret_cast<const uint32_t*>(comb_), reinterpret_cast<const float*>(selw_),
+            H, c_.hc, TK, gpu_rows);
     }
 
     void forward_chunk(const int* tokens, int n, float* logits, bool spec) {
@@ -2440,8 +2552,7 @@ private:
                     hc_mix(g.hc_ffn, x_, n);
                     moe_route_and_copy(l, n);
                 });
-                moe(l, n, true);
-                hc_combine(x_, n);
+                moe(l, n, x_, true);
             } else {
                 if (w_.layers[l].ple) ple(l, n);
                 hc_mix(g.hc_attn, x_, n);
@@ -2449,8 +2560,7 @@ private:
                 else deltanet(l, n, snap);
                 hc_combine(x_, n);
                 hc_mix(g.hc_ffn, x_, n);
-                moe(l, n, false);
-                hc_combine(x_, n);
+                moe(l, n, x_, false);
             }
         }
 
@@ -2518,6 +2628,7 @@ private:
                 q4_hc_cat_kernel<<<dim3(groups(2 * H, 256), n * c_.hc), 256, 0, stream_>>>(
                     reinterpret_cast<const float*>(men_), reinterpret_cast<const float*>(xnorm_),
                     reinterpret_cast<float*>(mcat_), H, c_.hc);
+                qx_valid_ = false;
                 mat(mtp_eh_, mcat_, mx_, n * c_.hc, 2 * H);
                 hc_mix(g.hc_attn, mx_, n);
                 attention(l, n, p0, deferred, reinterpret_cast<const AttnDynParams*>(d_attn_params_), attn_splits);
@@ -2525,8 +2636,7 @@ private:
                 hc_mix(g.hc_ffn, mx_, n);
                 moe_route_and_copy(l, n);
             });
-            moe(l, n, true);
-            hc_combine(mx_, n);
+            moe(l, n, mx_, true);
         } else {
             add_rmsnorm_kernel<<<n, 256, 0, stream_>>>(
                 reinterpret_cast<float*>(memb_), nullptr, reinterpret_cast<const float*>(mtp_enorm_),
@@ -2537,13 +2647,13 @@ private:
             q4_hc_cat_kernel<<<dim3(groups(2 * H, 256), n * c_.hc), 256, 0, stream_>>>(
                 reinterpret_cast<const float*>(men_), reinterpret_cast<const float*>(xnorm_),
                 reinterpret_cast<float*>(mcat_), H, c_.hc);
+            qx_valid_ = false;
             mat(mtp_eh_, mcat_, mx_, n * c_.hc, 2 * H);
             hc_mix(g.hc_attn, mx_, n);
             attention(l, n, p0, deferred);
             hc_combine(mx_, n);
             hc_mix(g.hc_ffn, mx_, n);
-            moe(l, n, false);
-            hc_combine(mx_, n);
+            moe(l, n, mx_, false);
         }
 
         if (logits) {
@@ -2605,12 +2715,14 @@ private:
     uint64_t x_ = 0, xnorm_ = 0, gate_ = 0, lo_ = 0, inj_ = 0, xn_ = 0, mix_ = 0;
     uint64_t qkv_ = 0, z_ = 0, a_ = 0, b_ = 0, core_ = 0;
     uint64_t qg_ = 0, kb_ = 0, vb_ = 0, qo_ = 0, att_ = 0, part_ = 0;
-    uint64_t sact_ = 0, sy_ = 0, sgate_ = 0, act_ = 0, ey_ = 0;
+    uint64_t sact_ = 0, sy_ = 0, sgate_ = 0, act_ = 0, ey_ = 0, cy16_ = 0;
     uint64_t rlogits_ = 0, selw_ = 0, comb_ = 0, sel_ = 0, logits_ = 0, dmask_ = 0, dtab_ = 0, xq_ = 0, xs_ = 0;
     uint64_t d_attn_params_ = 0;
     AttnDynParams* h_attn_params_ = nullptr;
     uint64_t emb_ = 0, pkey_ = 0, pval_ = 0, pgated_ = 0, ppad_ = 0;
-    bool fill_pending_ = false, use_dp4a_ = false, use_graph_ = true;
+    bool fill_pending_ = false, use_dp4a_ = false, use_graph_ = true, qx_valid_ = false;
+    uint64_t qx_x_ = 0;
+    int qx_n_ = 0, qx_cols_ = 0, qx_stride_ = 0;
     std::unordered_map<uint64_t, cudaGraphExec_t> pre_moe_graphs_, shared_graphs_;
 
     uint8_t *kcache_ = nullptr, *vcache_ = nullptr;
@@ -2630,7 +2742,7 @@ private:
     std::vector<int> pending_;
     std::vector<std::vector<int>> per_;
     std::vector<int> cpu_experts_;
-    std::vector<float> cg_, cu_, cx_;
+    std::vector<float> cg_, cu_, cx_, cy_f32_;
     std::vector<gq::GMat> cmats_;
     std::vector<uint64_t> usage_;
     std::vector<uint32_t> recent_;
