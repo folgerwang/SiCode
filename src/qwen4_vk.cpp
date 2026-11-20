@@ -34,6 +34,10 @@
 #include "qwen4_qsa.h"
 #include "vk_common.h"
 
+#if defined(__AVX512F__) || defined(__F16C__)
+#include <immintrin.h>
+#endif
+
 namespace {
 
 using namespace vkc;
@@ -72,6 +76,7 @@ struct PcAttnCombine { uint64_t part, qg, out; uint32_t n_heads, n_split; };
 struct PcRoute { uint64_t logits, sel, selw; uint32_t n_experts, top_k; };
 struct PcGroup { uint64_t sel, selw, loc, entries, toks, comb, args; uint32_t n_sel, top_k, n_experts, chunk, gx_up, gx_down; };
 struct PcCombine { uint64_t x, sgate, sy, ey, table; uint32_t dim, top_k; };
+struct PcMoeCombineHc { uint64_t x, inj, sgate, sy, ey, cy16, row_ids, selw; uint32_t dim, hc, top_k, gpu_rows; };
 struct PcCombW { uint64_t comb, selw; uint32_t n; };
 
 struct ExpertEntry { uint64_t base; uint32_t start, count; };  // matches `Entry` in the expert shaders
@@ -96,6 +101,40 @@ struct GLayer {
 
 uint32_t groups(uint32_t n, uint32_t per) { return (n + per - 1) / per; }
 VkDeviceSize align256(VkDeviceSize v) { return (v + 255) & ~VkDeviceSize(255); }
+
+inline uint16_t f32_to_f16_scalar(float f) {
+    uint32_t x;
+    std::memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int exp = (int)((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000u;
+        uint32_t t = mant >> (14 - exp);
+        return (uint16_t)(sign | t);
+    }
+    if (exp >= 31) return (uint16_t)(sign | 0x7BFFu);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | ((mant + 0x1000u) >> 13));
+}
+
+void f32_to_f16_vec(const float* src, uint16_t* dst, size_t n) {
+    size_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16) {
+        __m512 v = _mm512_loadu_ps(src + i);
+        __m256i h = _mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), h);
+    }
+#elif defined(__F16C__)
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(src + i);
+        __m128i h = _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), h);
+    }
+#endif
+    for (; i < n; i++) dst[i] = f32_to_f16_scalar(src[i]);
+}
 
 // One Q8_0 row -> planar int8 weights + f32 scales.
 void unpack_q8_row(const uint8_t* src, int cols, uint8_t* w, float* s) {
@@ -344,7 +383,7 @@ private:
     int ple_hist_ = 0, mask_words_ = 1;
 
     // activations (device local)
-    Ptr x_, xnorm_, gate_, lo_, inj_, xn_, mix_, qkv_, z_, a_, b_, core_, qg_, kb_, vb_, qo_, att_, part_, sact_, sy_, sgate_, act_, ey_;
+    Ptr x_, xnorm_, gate_, lo_, inj_, xn_, mix_, qkv_, z_, a_, b_, core_, qg_, kb_, vb_, qo_, att_, part_, sact_, sy_, sgate_, act_, ey_, cy16_;
     Ptr rlogits_, selw_, comb_, sel_, logits_, emb_, pkey_, pval_, pgated_, ppad_, xq_, xs_;
     bool use_dp4a_ = false, qx_valid_ = false;
     uint64_t qx_x_ = 0;
@@ -373,7 +412,7 @@ private:
     std::vector<int> pending_;                // keys to bring into the cache at the start of the next pass
     std::vector<std::vector<int>> per_;       // scratch: selections per expert
     std::vector<int> cpu_experts_;
-    std::vector<float> cg_, cu_, cx_;
+    std::vector<float> cg_, cu_, cx_, cy_f32_;
     std::vector<gq::GMat> cmats_;
     std::vector<uint64_t> usage_;             // selection counts per key (persisted)
     std::vector<uint32_t> recent_;            // the same for this session only
@@ -549,9 +588,10 @@ private:
         sgate_ = act(NMAX);
         act_ = act((size_t)NMAX * TK * c_.moe_inter);
         ey_ = act((size_t)NMAX * TK * H);
+        cy16_ = arena_.alloc((VkDeviceSize)NMAX * TK * H * 2);
         rlogits_ = act((size_t)NMAX * c_.n_experts);
         selw_ = act((size_t)NMAX * TK);
-        comb_ = act((size_t)NMAX * TK * 2);
+        comb_ = arena_.alloc((VkDeviceSize)NMAX * TK * 4);
         sel_ = arena_.alloc((VkDeviceSize)NMAX * TK * 4);
         logits_ = arena_.alloc((VkDeviceSize)c_.vocab * 4 * (draft_ + 1));
         const size_t max_qcols = (size_t)std::max({HC, 2 * H, c_.lin_value_dim(), c_.n_heads * c_.head_dim,
@@ -602,11 +642,11 @@ private:
         hemb_ = gpu_.create((VkDeviceSize)NMAX * H * 4, Mem::HostUpload);
         hsel_ = gpu_.create((VkDeviceSize)NMAX * TK * 4, Mem::HostRead);
         hxn_ = gpu_.create((VkDeviceSize)NMAX * H * 4, Mem::HostRead);
-        hcy_ = gpu_.create((VkDeviceSize)NMAX * TK * H * 4, Mem::HostUpload);
+        hcy_ = gpu_.create((VkDeviceSize)NMAX * TK * H * 2, Mem::HostUpload);
         const VkDeviceSize ne = (VkDeviceSize)NMAX * TK;
         htab_toks_ = align256(ne * sizeof(ExpertEntry));
         htab_comb_ = align256(htab_toks_ + ne * 4);
-        htab_ = gpu_.create(htab_comb_ + ne * 8, Mem::HostUpload);
+        htab_ = gpu_.create(htab_comb_ + ne * 4, Mem::HostUpload);
         hlog_ = gpu_.create((VkDeviceSize)c_.vocab * 4 * (draft_ + 1), Mem::HostRead);
         hqsa_ = gpu_.create(std::max<VkDeviceSize>((VkDeviceSize)n_qsa * NMAX * H * 4, 256), Mem::HostRead);
         hmask_ = gpu_.create((VkDeviceSize)NMAX * mask_words_ * 4, Mem::HostUpload);
@@ -1043,17 +1083,13 @@ private:
     }
 
     // Routed experts of layer l. Syncs once after routing: the GPU runs the experts it has cached while the CPU
-    // computes the others from the mapped GGUF; the block output lands in mix_. Leaves a command buffer open.
-    void moe(int l, int n) {
+    // computes the others from the mapped GGUF; the fused combine injects directly into residual streams `x_addr`.
+    void moe(int l, int n, uint64_t x_addr) {
         const GLayer& g = L_[l];
         const Q4Layer& W = w_.layers[l];
         const int H = c_.hidden, TK = c_.top_k, E = c_.n_experts, I = c_.moe_inter;
         mat(g.router, xn_.addr(), rlogits_.addr(), n, H, 0, 0, "router");
-        mat(g.sgate, xn_.addr(), sgate_.addr(), n, H, 0, 0, "shared_gate");
-        mat_swiglu(g.sh_gate, g.sh_up, xn_.addr(), sact_.addr(), n);
         gpu_.barrier();
-        qx_valid_ = false;
-        mat(g.sh_down, sact_.addr(), sy_.addr(), n, c_.shared_inter, 0, 0, "shared_down");
         PcRoute pr{rlogits_.addr(), sel_.addr(), selw_.addr(), (uint32_t)E, (uint32_t)TK};
         gpu_.dispatch("moe_route", pr, n);
         gpu_.barrier();
@@ -1103,38 +1139,45 @@ private:
                 for (uint32_t j = 0; j < cnt; j++) {
                     const int i = per_[e][i0 + j];
                     toks[row + j] = (uint32_t)(i / TK);
-                    comb[2 * i] = row + j;
+                    comb[i] = row + j;
                 }
                 row += cnt;
             }
         }
         const uint32_t gpu_rows = row;
 
-        // GPU: cached experts, submitted right away so they run while the CPU computes the others; everything
-        // recorded after that is queued behind them and waited for at the next sync
+        // GPU: shared expert + cached routed experts, submitted right away via submit_chain() so they run
+        // in parallel while the CPU computes the uncached experts
         gpu_.begin();
+        mat(g.sgate, xn_.addr(), sgate_.addr(), n, H, 0, 0, "shared_gate");
+        mat_swiglu(g.sh_gate, g.sh_up, xn_.addr(), sact_.addr(), n);
         if (ne) {
             const uint64_t tab = htab_->addr, tk = htab_->addr + htab_toks_;
             PcExpert pu{tab, tk, xn_.addr(), act_.addr(), 0, g.s_gate, g.off_up, g.s_up, (uint32_t)I, (uint32_t)H,
                         (uint32_t)H, (uint32_t)I, 0};
             gpu_.dispatch((gemm ? g.gemm_up : g.pipe_up).c_str(), pu, groups(I, rpw), ne);
-            gpu_.barrier();
+        }
+        gpu_.barrier();
+        qx_valid_ = false;
+        mat(g.sh_down, sact_.addr(), sy_.addr(), n, c_.shared_inter, 0, 0, "shared_down");
+        if (ne) {
+            const uint64_t tab = htab_->addr, tk = htab_->addr + htab_toks_;
             PcExpert pd{tab, tk, act_.addr(), ey_.addr(), g.off_down, g.s_down, 0, 0, (uint32_t)H, (uint32_t)I,
                         (uint32_t)I, (uint32_t)H, 1};
             gpu_.dispatch((gemm ? g.gemm_down : g.pipe_down).c_str(), pd, groups(H, rpw), ne);
-            gpu_.barrier();
-            gpu_.submit_chain();
         }
+        gpu_.barrier();
+        gpu_.submit_chain();
 
-        // CPU: the other experts, straight from the mapped weights
+        // CPU: the other experts, straight from the mapped weights; pack output to fp16 for 2x less PCIe traffic
         size_t rows_cpu = 0;
         for (int e : cpu_experts_) rows_cpu += per_[e].size();
         if (rows_cpu) {
             const float* xn = (const float*)hxn_->map;
-            float* cy = (float*)hcy_->map;
             cg_.resize(rows_cpu * I);
             cu_.resize(rows_cpu * I);
             cx_.resize(rows_cpu * H);
+            cy_f32_.resize(rows_cpu * H);
             cmats_.resize(cpu_experts_.size() * 3);
             std::vector<gq::Job> jobs;
             size_t r = 0;
@@ -1149,7 +1192,7 @@ private:
                     for (int j = 0; j < cnt; j++) std::memcpy(&cx_[(r + j) * H], xn + (size_t)(per_[e][j] / TK) * H, (size_t)H * 4);
                     x = &cx_[r * H];
                 }
-                for (int j = 0; j < cnt; j++) comb[2 * per_[e][j]] = gpu_rows + (uint32_t)(r + j);
+                for (int j = 0; j < cnt; j++) comb[per_[e][j]] = gpu_rows + (uint32_t)(r + j);
                 jobs.push_back({&cmats_[a * 3], x, &cg_[r * I], cnt});
                 jobs.push_back({&cmats_[a * 3 + 1], x, &cu_[r * I], cnt});
                 r += cnt;
@@ -1162,23 +1205,25 @@ private:
             r = 0;
             for (size_t a = 0; a < cpu_experts_.size(); a++) {
                 const int cnt = (int)per_[cpu_experts_[a]].size();
-                jobs.push_back({&cmats_[a * 3 + 2], &cg_[r * I], cy + r * H, cnt});
+                jobs.push_back({&cmats_[a * 3 + 2], &cg_[r * I], cy_f32_.data() + r * H, cnt});
                 r += cnt;
             }
             gq::run_jobs(cpu_, jobs);
+            uint16_t* cy16 = (uint16_t*)hcy_->map;
+            cpu_.parallel_for((int64_t)rows_cpu, [&](int64_t b, int64_t e2) {
+                f32_to_f16_vec(cy_f32_.data() + (size_t)b * H, cy16 + (size_t)b * H, (size_t)(e2 - b) * H);
+            }, 1);
         }
         t_gpu_ += std::chrono::duration<double>(tp1 - tp0).count();
         t_cpu_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - tp1).count();
 
-        // GPU: bring the CPU rows next to the GPU rows, then combine (weights from moe_route via selw_)
-        if (rows_cpu) gpu_.copy(hcy_, 0, ey_.b, ey_.off + (VkDeviceSize)gpu_rows * H * 4, (VkDeviceSize)rows_cpu * H * 4);
-        gpu_.copy(htab_, htab_comb_, comb_.b, comb_.off, (VkDeviceSize)n * TK * 8);
+        // GPU: upload fp16 CPU rows + row_ids, then run fused combine + hyper-connection injection
+        if (rows_cpu) gpu_.copy(hcy_, 0, cy16_.b, cy16_.off, (VkDeviceSize)rows_cpu * H * 2);
+        gpu_.copy(htab_, htab_comb_, comb_.b, comb_.off, (VkDeviceSize)n * TK * 4);
         gpu_.barrier();
-        PcCombW pw{comb_.addr(), selw_.addr(), (uint32_t)(n * TK)};
-        gpu_.dispatch("comb_weights", pw, groups(n * TK, 256));
-        gpu_.barrier();
-        PcCombine pc{mix_.addr(), sgate_.addr(), sy_.addr(), ey_.addr(), comb_.addr(), (uint32_t)H, (uint32_t)TK};
-        gpu_.dispatch("moe_combine_set", pc, groups(H, 256), n);
+        PcMoeCombineHc pc{x_addr, inj_.addr(), sgate_.addr(), sy_.addr(), ey_.addr(), cy16_.addr(), comb_.addr(),
+                          selw_.addr(), (uint32_t)H, (uint32_t)c_.hc, (uint32_t)TK, gpu_rows};
+        gpu_.dispatch("q4_moe_combine_hc", pc, groups(H, 256), n);
         gpu_.barrier();
     }
 
@@ -1247,8 +1292,7 @@ private:
             else deltanet(l, n, spec && n > 1);
             hc_combine(x_.addr(), n);
             hc_mix(g.hc_ffn, x_.addr(), n);
-            moe(l, n);
-            hc_combine(x_.addr(), n);
+            moe(l, n, x_.addr());
         }
         const int n_out = spec ? n : 1;
         if (logits) {  // the final mixer is the output norm
@@ -1304,8 +1348,7 @@ private:
         attention(l, n, p0, deferred);
         hc_combine(mx_.addr(), n);
         hc_mix(g.hc_ffn, mx_.addr(), n);
-        moe(l, n);
-        hc_combine(mx_.addr(), n);
+        moe(l, n, mx_.addr());
         if (logits) {
             hc_mix(mtp_head_, mx_.addr() + (uint64_t)(n - 1) * HC * 4, 1);
             mat(output_, xn_.addr(), logits_.addr(), 1, H, 0, 0, "mtp_head");

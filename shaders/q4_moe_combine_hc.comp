@@ -1,0 +1,38 @@
+// Fused MoE combine + hyper-connection residual injection (replaces comb_weights + moe_combine_set + hc_combine).
+// Reads GPU expert outputs from fp32 `ey` (row < gpu_rows) and CPU expert outputs from fp16 `cy16` (row >= gpu_rows),
+// applies router weights `selw` directly, adds the shared expert, and injects into all `hc` residual streams of `x`
+// without touching intermediate `mix_` in VRAM.
+#version 460
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t x, inj, sgate, sy, ey, cy16, row_ids, selw;
+    uint dim, hc, top_k, gpu_rows;
+} pc;
+
+void main() {
+    const uint d = gl_GlobalInvocationID.x, t = gl_WorkGroupID.y;
+    if (d >= pc.dim) return;
+    F32 sy = F32(pc.sy), ey = F32(pc.ey), selw = F32(pc.selw);
+    U32 cy16 = U32(pc.cy16), rids = U32(pc.row_ids);
+    float blk = sigmoid(F32(pc.sgate).v[t]) * sy.v[t * pc.dim + d];
+    const uint base = t * pc.top_k;
+    for (uint k = 0; k < pc.top_k; k++) {
+        const uint r = rids.v[base + k];
+        const float w = selw.v[base + k];
+        float v;
+        if (r < pc.gpu_rows) {
+            v = ey.v[r * pc.dim + d];
+        } else {
+            const uint idx = (r - pc.gpu_rows) * pc.dim + d;
+            const vec2 p = unpackHalf2x16(cy16.v[idx >> 1]);
+            v = (idx & 1u) == 0u ? p.x : p.y;
+        }
+        blk += w * v;
+    }
+    F32 x = F32(pc.x + uint64_t(t) * pc.hc * pc.dim * 4u);
+    F32 inj = F32(pc.inj);
+    for (uint s = 0; s < pc.hc; s++)
+        x.v[s * pc.dim + d] += 2.0 * sigmoid(inj.v[t * pc.hc + s] / float(pc.hc)) * blk;
+}
