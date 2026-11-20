@@ -149,10 +149,15 @@ endif()
 if(QW_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+        set(QW_CUDA_ARCHS "86;89;120")
+    else()
+        set(QW_CUDA_ARCHS "86;89")
+    endif()
     set_target_properties(qwen PROPERTIES
         CUDA_STANDARD 20
         CUDA_STANDARD_REQUIRED ON
-        CUDA_ARCHITECTURES "86;89")
+        CUDA_ARCHITECTURES "${QW_CUDA_ARCHS}")
     target_sources(qwen PRIVATE src/qwen4_cuda.cu)
     if(NOT QW_VULKAN)
         target_sources(qwen PRIVATE src/vram_query.cpp)

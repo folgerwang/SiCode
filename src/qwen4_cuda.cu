@@ -264,7 +264,8 @@ __global__ void q4_matmul_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a2_p
         for (uint32_t t = 0; t < NT; t++) {
             if (t >= nt) break;
             const float4* xs = reinterpret_cast<const float4*>(x_ptr + (uint64_t)xrow[t] * x_stride * 4u);
-            const float4 x0 = xs[c * 4u], x1 = xs[c * 4u + 1u], x2 = xs[c * 4u + 2u], x3 = xs[c * 4u + 3u];
+            const float4 x0 = __ldg(&xs[c * 4u]), x1 = __ldg(&xs[c * 4u + 1u]);
+            const float4 x2 = __ldg(&xs[c * 4u + 2u]), x3 = __ldg(&xs[c * 4u + 3u]);
             acc1[t] += f4_dot(a0, x0) + f4_dot(a1, x1) + f4_dot(a2, x2) + f4_dot(a3, x3);
             if constexpr (SwiGLU) {
                 acc2[t] += f4_dot(b0, x0) + f4_dot(b1, x1) + f4_dot(b2, x2) + f4_dot(b3, x3);
@@ -354,21 +355,21 @@ __global__ void q4_matmul_q8_dp4a_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint6
     }
 
     for (uint32_t b = lane; b < nblk; b += 32u) {
-        const int4 w1a = W1[b * 2u], w1b = W1[b * 2u + 1u];
-        const float sc1 = S1[b];
+        const int4 w1a = __ldg(&W1[b * 2u]), w1b = __ldg(&W1[b * 2u + 1u]);
+        const float sc1 = __ldg(&S1[b]);
         int4 w2a, w2b;
         float sc2 = 0.0f;
         if constexpr (SwiGLU) {
-            w2a = W2[b * 2u];
-            w2b = W2[b * 2u + 1u];
-            sc2 = S2[b];
+            w2a = __ldg(&W2[b * 2u]);
+            w2b = __ldg(&W2[b * 2u + 1u]);
+            sc2 = __ldg(&S2[b]);
         }
 #pragma unroll
         for (uint32_t t = 0; t < NT; t++) {
             if (t >= nt) break;
             const int4* X = reinterpret_cast<const int4*>(xq + (uint64_t)xrow[t] * cols);
-            const int4 xa = X[b * 2u], xb = X[b * 2u + 1u];
-            const float xsc = xs[(uint64_t)xrow[t] * nblk + b];
+            const int4 xa = __ldg(&X[b * 2u]), xb = __ldg(&X[b * 2u + 1u]);
+            const float xsc = __ldg(&xs[(uint64_t)xrow[t] * nblk + b]);
             int s = 0;
             s = __dp4a(w1a.x, xa.x, s);
             s = __dp4a(w1a.y, xa.y, s);
@@ -504,10 +505,11 @@ __global__ void q4_matmul_wide_q8_dp4a_kernel(uint64_t w1, uint64_t s1, const in
 // Tensor Core WMMA GEMM kernel (64x64x32, 8 warps = 256 threads, pure-FP16 smem, 2 blocks/SM)
 // =============================================================================================
 template <Codec C, bool Expert, bool SwiGLU>
-__global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a2_ptr, uint64_t a3_ptr,
-                                    uint64_t x_ptr, uint64_t y_ptr, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3,
-                                    uint32_t rows, uint32_t cols, uint32_t n_or_xmode, uint32_t x_stride,
-                                    uint32_t y_stride, uint32_t post, float post_scale) {
+__global__ void __launch_bounds__(256, 2) q4_gemm_wmma_kernel(
+    uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a2_ptr, uint64_t a3_ptr,
+    uint64_t x_ptr, uint64_t y_ptr, uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3,
+    uint32_t rows, uint32_t cols, uint32_t n_or_xmode, uint32_t x_stride,
+    uint32_t y_stride, uint32_t post, float post_scale) {
     using namespace nvcuda;
     constexpr uint32_t BM = 64, BN = 64, BK = 32, LDA = BK + 8, LDC = BM + 4;
     __shared__ __half Ws[BM * LDA];
@@ -559,26 +561,37 @@ __global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a
     }
 
     auto store_h8 = [](__half* dst, float4 a, float4 b) {
-        dst[0] = __float2half(a.x); dst[1] = __float2half(a.y); dst[2] = __float2half(a.z); dst[3] = __float2half(a.w);
-        dst[4] = __float2half(b.x); dst[5] = __float2half(b.y); dst[6] = __float2half(b.z); dst[7] = __float2half(b.w);
+        __half2* d2 = reinterpret_cast<__half2*>(dst);
+        d2[0] = __float22half2_rn(make_float2(a.x, a.y));
+        d2[1] = __float22half2_rn(make_float2(a.z, a.w));
+        d2[2] = __float22half2_rn(make_float2(b.x, b.y));
+        d2[3] = __float22half2_rn(make_float2(b.z, b.w));
     };
 
-    for (uint32_t k0 = 0; k0 < cols; k0 += BK) {
-        float4 a, b;
+    auto load_tile = [&](uint32_t k0, float4& a, float4& b, float4& a2, float4& b2, float4& x0, float4& x1) {
         decode8<C>(w1, s1, cols, wrow, (k0 + lk) >> 3, a, b);
-        store_h8(&Ws[lr * LDA + lk], a, b);
-        if constexpr (SwiGLU) {
-            float4 a2, b2;
-            decode8<C>(w2, s2, cols, wrow, (k0 + lk) >> 3, a2, b2);
-            store_h8(&Ws2[lr * LDA + lk], a2, b2);
-        }
-        float4 x0 = make_float4(0, 0, 0, 0), x1 = make_float4(0, 0, 0, 0);
+        if constexpr (SwiGLU) decode8<C>(w2, s2, cols, wrow, (k0 + lk) >> 3, a2, b2);
+        x0 = make_float4(0, 0, 0, 0);
+        x1 = make_float4(0, 0, 0, 0);
         if (tok_ok) {
-            x0 = xs[(k0 + lk) / 4u];
-            x1 = xs[(k0 + lk) / 4u + 1u];
+            x0 = __ldg(&xs[(k0 + lk) / 4u]);
+            x1 = __ldg(&xs[(k0 + lk) / 4u + 1u]);
         }
-        store_h8(&Xs[lr * LDA + lk], x0, x1);
+    };
+
+    float4 ca, cb, ca2, cb2, cx0, cx1;
+    if (cols > 0u) {
+        load_tile(0u, ca, cb, ca2, cb2, cx0, cx1);
+        store_h8(&Ws[lr * LDA + lk], ca, cb);
+        if constexpr (SwiGLU) store_h8(&Ws2[lr * LDA + lk], ca2, cb2);
+        store_h8(&Xs[lr * LDA + lk], cx0, cx1);
         __syncthreads();
+    }
+
+    for (uint32_t k0 = 0; k0 < cols; k0 += BK) {
+        const bool has_next = (k0 + BK) < cols;
+        float4 na, nb, na2, nb2, nx0, nx1;
+        if (has_next) load_tile(k0 + BK, na, nb, na2, nb2, nx0, nx1);
 
 #pragma unroll
         for (uint32_t kk = 0; kk < BK; kk += 16u) {
@@ -593,7 +606,13 @@ __global__ void q4_gemm_wmma_kernel(uint64_t a0_ptr, uint64_t a1_ptr, uint64_t a
                 if constexpr (SwiGLU) wmma::mma_sync(acc2[j], fa2, fb, acc2[j]);
             }
         }
-        __syncthreads();
+        if (has_next) {
+            __syncthreads();
+            store_h8(&Ws[lr * LDA + lk], na, nb);
+            if constexpr (SwiGLU) store_h8(&Ws2[lr * LDA + lk], na2, nb2);
+            store_h8(&Xs[lr * LDA + lk], nx0, nx1);
+            __syncthreads();
+        }
     }
 
 #pragma unroll
