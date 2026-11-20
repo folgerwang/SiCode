@@ -1,6 +1,11 @@
-// Y[t, row] = sum_c W[row, c] * X[t, c] for GGUF-quantized W, decoded on the fly. One 32-lane subgroup per
-// row, 8 rows per workgroup, up to NT tokens per pass (gl_WorkGroupID.y selects the token chunk).
-// The weight codec is picked per pipeline, see q4_codec.glsl.
+// Y[t, row] = sum_c W[row, c] * X[t, c] for GGUF-quantized W, decoded on the fly.
+//
+// Default mode: one 32-lane subgroup per row, 8 rows per workgroup, up to NT=8 tokens per pass.
+//   Uses 16 KB shared memory (Xs[NT][128]) so all 256 threads cooperatively load X[0..nt-1] once per
+//   512-element K-tile, eliminating 8x redundant global reads of X across the 8 subgroups.
+// WIDE mode (-DWIDE): one full 256-thread workgroup (8 subgroups) per row, reducing across subgroups
+//   in shared memory. Used for tiny-row, wide-K matrices (hc_down, hc_inject, shared_gate, dn_alpha/beta)
+//   that otherwise under-utilize wide GPUs.
 // Variants: SWIGLU computes silu(W1 x) * (W2 x); EXPERT reads per-workgroup weights/tokens from a table.
 #version 460
 #include "common.glsl"
@@ -32,6 +37,44 @@ void decode(uint64_t w, uint64_t s, uint row, uint c, out vec4 a0, out vec4 a1, 
     decode8(w, s, pc.cols, row, c * 2u + 1u, a2, a3);
 }
 
+#ifdef WIDE
+shared float red1[NT][8];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, sg = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+    const uint chunks = pc.cols / 16u;
+    const uint t0 = gl_WorkGroupID.y * NT;
+    const uint nt = min(NT, pc.n - t0);
+
+    float acc[NT];
+    [[unroll]] for (uint t = 0; t < NT; t++) acc[t] = 0.0;
+
+    for (uint c = tid; c < chunks; c += 256u) {
+        vec4 a0, a1, a2, a3;
+        decode(pc.w1, pc.s1, row, c, a0, a1, a2, a3);
+        [[unroll]] for (uint t = 0; t < NT; t++) {
+            if (t >= nt) break;
+            F4 xs = F4(pc.x + uint64_t(t0 + t) * pc.x_stride * 4u);
+            const vec4 x0 = xs.v[c * 4u], x1 = xs.v[c * 4u + 1u], x2 = xs.v[c * 4u + 2u], x3 = xs.v[c * 4u + 3u];
+            acc[t] += dot(a0, x0) + dot(a1, x1) + dot(a2, x2) + dot(a3, x3);
+        }
+    }
+    [[unroll]] for (uint t = 0; t < NT; t++) {
+        if (t >= nt) break;
+        const float r = subgroupAdd(acc[t]);
+        if (lane == 0u) red1[t][sg] = r;
+    }
+    barrier();
+    if (sg == 0u && lane < nt) {
+        float tot = 0.0;
+        [[unroll]] for (uint i = 0; i < 8u; i++) tot += red1[lane][i];
+        if (pc.post == 1u) tot = silu(tot * pc.post_scale);
+        F32(pc.y + uint64_t(t0 + lane) * pc.y_stride * 4u).v[row] = tot;
+    }
+}
+#else
 void main() {
     const uint team = gl_SubgroupID, lane = gl_SubgroupInvocationID;
     const uint row = gl_WorkGroupID.x * 8u + team;
@@ -90,3 +133,4 @@ void main() {
         }
     }
 }
+#endif

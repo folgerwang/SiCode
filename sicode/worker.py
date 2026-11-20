@@ -219,6 +219,7 @@ class Engine:
                 ("VRAM:", 0.45, "sizing VRAM"),
                 ("dense weights", 0.35, "uploading dense weights"),
                 ("[vulkan]", 0.15, "initializing GPU"),
+                ("[cuda]", 0.15, "initializing GPU"),
                 ("[cpu]", 0.25, "loading model on CPU"),
             ]
             def _watch():

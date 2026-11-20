@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(QW_VULKAN "Build the Vulkan compute backend" OFF)
+option(QW_CUDA "Build the CUDA compute backend" OFF)
 option(QW_NATIVE "Optimize for the build machine (AVX-512 etc.)" ON)
 
 add_executable(qwen
@@ -20,14 +21,14 @@ add_executable(qwen
     src/qwen4_cpu.cpp)
 
 if(MSVC)
-    target_compile_options(qwen PRIVATE /O2 /utf-8 /W3 /bigobj /fp:fast)
+    target_compile_options(qwen PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/O2 /utf-8 /W3 /bigobj /fp:fast>)
     if(QW_NATIVE)
-        target_compile_options(qwen PRIVATE /arch:AVX512)
+        target_compile_options(qwen PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
     endif()
 else()
-    target_compile_options(qwen PRIVATE -O3 -Wall -ffast-math)
+    target_compile_options(qwen PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3 -Wall -ffast-math>)
     if(QW_NATIVE)
-        target_compile_options(qwen PRIVATE -march=native)
+        target_compile_options(qwen PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-march=native>)
     endif()
     find_package(Threads REQUIRED)
     target_link_libraries(qwen PRIVATE Threads::Threads)
@@ -66,6 +67,12 @@ if(QW_VULKAN)
         "q4_matmul_q8_swiglu|q4_matmul.comp|-DC_Q8 -DSWIGLU"
         "q4_matmul_f32|q4_matmul.comp|-DC_F32"
         "q4_matmul_f32_swiglu|q4_matmul.comp|-DC_F32 -DSWIGLU"
+        "q4_matmul_wide_q8|q4_matmul.comp|-DC_Q8 -DWIDE"
+        "q4_matmul_wide_f32|q4_matmul.comp|-DC_F32 -DWIDE"
+        "q4_quant_x|q4_quant_x.comp|"
+        "q4_matmul_dp4a|q4_matmul_dp4a.comp|"
+        "q4_matmul_dp4a_swiglu|q4_matmul_dp4a.comp|-DSWIGLU"
+        "q4_matmul_wide_dp4a|q4_matmul_dp4a.comp|-DWIDE"
         "q4_expert_q4k_swiglu|q4_matmul.comp|-DC_Q4K -DEXPERT -DSWIGLU"
         "q4_expert_q5k_swiglu|q4_matmul.comp|-DC_Q5K -DEXPERT -DSWIGLU"
         "q4_expert_q8_swiglu|q4_matmul.comp|-DC_Q8 -DEXPERT -DSWIGLU"
@@ -84,6 +91,17 @@ if(QW_VULKAN)
         "q4_gemm_expert_q8|q4_gemm.comp|-DC_Q8 -DEXPERT"
         "q4_gemm_expert_q4k|q4_gemm.comp|-DC_Q4K -DEXPERT"
         "q4_gemm_expert_q5k|q4_gemm.comp|-DC_Q5K -DEXPERT"
+        "q4_gemm_coop_q8|q4_gemm_coop.comp|-DC_Q8"
+        "q4_gemm_coop_q8_swiglu|q4_gemm_coop.comp|-DC_Q8 -DSWIGLU"
+        "q4_gemm_coop_f32|q4_gemm_coop.comp|-DC_F32"
+        "q4_gemm_coop_f32_swiglu|q4_gemm_coop.comp|-DC_F32 -DSWIGLU"
+        "q4_gemm_coop_expert_q4k_swiglu|q4_gemm_coop.comp|-DC_Q4K -DEXPERT -DSWIGLU"
+        "q4_gemm_coop_expert_q5k_swiglu|q4_gemm_coop.comp|-DC_Q5K -DEXPERT -DSWIGLU"
+        "q4_gemm_coop_expert_q8_swiglu|q4_gemm_coop.comp|-DC_Q8 -DEXPERT -DSWIGLU"
+        "q4_gemm_coop_expert_q51|q4_gemm_coop.comp|-DC_Q51 -DEXPERT"
+        "q4_gemm_coop_expert_q8|q4_gemm_coop.comp|-DC_Q8 -DEXPERT"
+        "q4_gemm_coop_expert_q4k|q4_gemm_coop.comp|-DC_Q4K -DEXPERT"
+        "q4_gemm_coop_expert_q5k|q4_gemm_coop.comp|-DC_Q5K -DEXPERT"
         "q4_hc_norm|q4_hc.comp|-DHC_NORM"
         "q4_hc_mix|q4_hc.comp|-DHC_MIX"
         "q4_hc_combine|q4_hc.comp|-DHC_COMBINE"
@@ -125,4 +143,24 @@ if(QW_VULKAN)
     target_include_directories(qwen PRIVATE ${CMAKE_BINARY_DIR}/gen)
     target_compile_definitions(qwen PRIVATE QW_VULKAN=1)
     target_link_libraries(qwen PRIVATE Vulkan::Vulkan)
+endif()
+
+if(QW_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set_target_properties(qwen PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_ARCHITECTURES "86;89")
+    target_sources(qwen PRIVATE src/qwen4_cuda.cu)
+    if(NOT QW_VULKAN)
+        target_sources(qwen PRIVATE src/vram_query.cpp)
+    endif()
+    target_compile_definitions(qwen PRIVATE QW_CUDA=1)
+    if(MSVC)
+        target_compile_options(qwen PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -allow-unsupported-compiler -Xcompiler=/utf-8 -Xcompiler=/bigobj>)
+    else()
+        target_compile_options(qwen PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    endif()
+    target_link_libraries(qwen PRIVATE CUDA::cudart)
 endif()

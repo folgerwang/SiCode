@@ -55,6 +55,8 @@ constexpr float DRAFT_P_MIN = 0.5f; // stop drafting when the draft head's best 
 
 // Push-constant layouts (must match the shaders, std430)
 struct PcMat { uint64_t w1, s1, w2, s2, x, y; uint32_t rows, cols, n, x_stride, y_stride, post; float post_scale; };
+struct PcQuantX { uint64_t x, xq, xs; uint32_t cols, x_stride, n; };
+struct PcMatDp4a { uint64_t w1, s1, w2, s2, xq, xs, y; uint32_t rows, cols, n, y_stride, post; float post_scale; };
 struct PcExpert { uint64_t table, toks, x, y; uint32_t woff1, soff1, woff2, soff2, rows, cols, x_stride, y_stride, x_mode; };
 struct PcHc { uint64_t a, b, c; uint32_t dim, hc; float eps; };
 struct PcPleGate { uint64_t key, value, x, wk, wq, wc, gated, pad; uint32_t dim, hc, hist; float eps; };
@@ -120,6 +122,7 @@ public:
             c.n_experts > 1024 || c.rope_dim > 256)
             throw std::runtime_error("model dimensions not supported by the Vulkan shaders");
         // tokens the MTP head drafts per pass; with them a pass is draft_ + 1 tokens, one matvec chunk at most
+        use_dp4a_ = gpu_.dp4a() && std::getenv("QW_DP4A") != nullptr;
         draft_ = w.has_mtp ? std::max(0, std::min(opt.draft, NT - 1)) : 0;
         if (const char* tp = std::getenv("QW_TRACE")) trace_ = std::fopen(tp, "ab");
         sys_free0_ = qw_system_free_vram(gpu_.device_name());  // before our buffers: Windows only counts them once used
@@ -342,7 +345,10 @@ private:
 
     // activations (device local)
     Ptr x_, xnorm_, gate_, lo_, inj_, xn_, mix_, qkv_, z_, a_, b_, core_, qg_, kb_, vb_, qo_, att_, part_, sact_, sy_, sgate_, act_, ey_;
-    Ptr rlogits_, selw_, comb_, sel_, logits_, emb_, pkey_, pval_, pgated_, ppad_;
+    Ptr rlogits_, selw_, comb_, sel_, logits_, emb_, pkey_, pval_, pgated_, ppad_, xq_, xs_;
+    bool use_dp4a_ = false, qx_valid_ = false;
+    uint64_t qx_x_ = 0;
+    int qx_n_ = 0, qx_cols_ = 0, qx_stride_ = 0;
     Buf* kcache_ = nullptr;
     Buf* vcache_ = nullptr;
     Buf* conv_state_ = nullptr;
@@ -548,6 +554,10 @@ private:
         comb_ = act((size_t)NMAX * TK * 2);
         sel_ = arena_.alloc((VkDeviceSize)NMAX * TK * 4);
         logits_ = arena_.alloc((VkDeviceSize)c_.vocab * 4 * (draft_ + 1));
+        const size_t max_qcols = (size_t)std::max({HC, 2 * H, c_.lin_value_dim(), c_.n_heads * c_.head_dim,
+                                                   c_.shared_inter, c_.moe_inter});
+        xq_ = arena_.alloc((VkDeviceSize)NT * max_qcols);
+        xs_ = arena_.alloc((VkDeviceSize)NT * (max_qcols / 32) * 4);
         if (draft_) {
             mx_ = act((size_t)NMAX * HC);
             mh_ = act((size_t)NMAX * HC);
@@ -696,8 +706,9 @@ private:
                                          gtype_name(W.ex_gate.type) + "/" + gtype_name(W.ex_up.type) + "/" + gtype_name(W.ex_down.type));
             g.pipe_up = std::string("q4_expert_") + cu + "_swiglu";
             g.pipe_down = std::string("q4_expert_") + cd;
-            g.gemm_up = std::string("q4_gemm_expert_") + cu + "_swiglu";
-            g.gemm_down = std::string("q4_gemm_expert_") + cd;
+            const std::string gpref = gpu_.coop() ? "q4_gemm_coop_expert_" : "q4_gemm_expert_";
+            g.gemm_up = gpref + cu + "_swiglu";
+            g.gemm_down = gpref + cd;
             auto planar_w = [](const gq::GMat& m) { return (uint32_t)align256((VkDeviceSize)m.rows * m.cols); };
             const gq::GMat ga = W.ex_gate.slice(0), ua = W.ex_up.slice(0), da = W.ex_down.slice(0);
             VkDeviceSize o = 0;
@@ -844,27 +855,58 @@ private:
         f.write((const char*)usage_.data(), usage_.size() * 8);
     }
 
+    void ensure_qx(uint64_t x, int n, int cols, int x_stride) {
+        if (qx_valid_ && qx_x_ == x && qx_n_ == n && qx_cols_ == cols && qx_stride_ == x_stride) return;
+        PcQuantX pq{x, xq_.addr(), xs_.addr(), (uint32_t)cols, (uint32_t)x_stride, (uint32_t)n};
+        gpu_.dispatch("q4_quant_x", pq, groups((uint32_t)(cols >> 5), 8), (uint32_t)n);
+        gpu_.barrier();
+        qx_valid_ = true;
+        qx_x_ = x; qx_n_ = n; qx_cols_ = cols; qx_stride_ = x_stride;
+    }
+
     // ---- recording helpers --------------------------------------------------------------------
     // y[n][rows] = x[n][x_stride >= cols] W^T; post 1 applies silu(y * post_scale).
     void mat(const GM& m, uint64_t x, uint64_t y, int n, int x_stride, uint32_t post = 0, float post_scale = 0, const char* label = nullptr) {
+        if (y == qx_x_) qx_valid_ = false;
         PcMat pc{m.w.addr(), m.s.addr(), 0, 0, x, y, (uint32_t)m.rows, (uint32_t)m.cols, (uint32_t)n, (uint32_t)x_stride,
                  (uint32_t)m.rows, post, post_scale};
-        if (n >= GEMM_MIN && m.rows % 64 == 0)
-            gpu_.dispatch(m.q8 ? "q4_gemm_q8" : "q4_gemm_f32", pc, groups(m.rows, 64), groups(n, 64), 1, label);
-        else
+        if (n >= GEMM_MIN && m.rows % 64 == 0) {
+            const char* p = gpu_.coop() ? (m.q8 ? "q4_gemm_coop_q8" : "q4_gemm_coop_f32")
+                                        : (m.q8 ? "q4_gemm_q8" : "q4_gemm_f32");
+            gpu_.dispatch(p, pc, groups(m.rows, 64), groups(n, 64), 1, label);
+        } else if (use_dp4a_ && m.q8 && n <= NT) {
+            ensure_qx(x, n, m.cols, x_stride);
+            PcMatDp4a pd{m.w.addr(), m.s.addr(), 0, 0, xq_.addr(), xs_.addr(), y, (uint32_t)m.rows, (uint32_t)m.cols,
+                         (uint32_t)n, (uint32_t)m.rows, post, post_scale};
+            if (m.rows <= 256 && m.cols >= 2048)
+                gpu_.dispatch("q4_matmul_wide_dp4a", pd, (uint32_t)m.rows, 1, 1, label);
+            else
+                gpu_.dispatch("q4_matmul_dp4a", pd, groups(m.rows, 8), 1, 1, label);
+        } else if (m.rows <= 256 && m.cols >= 2048) {
+            gpu_.dispatch(m.q8 ? "q4_matmul_wide_q8" : "q4_matmul_wide_f32", pc, (uint32_t)m.rows, groups(n, NT), 1, label);
+        } else
             gpu_.dispatch(m.q8 ? "q4_matmul_q8" : "q4_matmul_f32", pc, groups(m.rows, 8), groups(n, NT), 1, label);
     }
     void mat_swiglu(const GM& g, const GM& u, uint64_t x, uint64_t y, int n) {
+        if (y == qx_x_) qx_valid_ = false;
         PcMat pc{g.w.addr(), g.s.addr(), u.w.addr(), u.s.addr(), x, y, (uint32_t)g.rows, (uint32_t)g.cols, (uint32_t)n,
                  (uint32_t)g.cols, (uint32_t)g.rows, 0, 0};
-        if (n >= GEMM_MIN && g.rows % 64 == 0)
-            gpu_.dispatch(g.q8 ? "q4_gemm_q8_swiglu" : "q4_gemm_f32_swiglu", pc, groups(g.rows, 64), groups(n, 64));
-        else
+        if (n >= GEMM_MIN && g.rows % 64 == 0) {
+            const char* p = gpu_.coop() ? (g.q8 ? "q4_gemm_coop_q8_swiglu" : "q4_gemm_coop_f32_swiglu")
+                                        : (g.q8 ? "q4_gemm_q8_swiglu" : "q4_gemm_f32_swiglu");
+            gpu_.dispatch(p, pc, groups(g.rows, 64), groups(n, 64));
+        } else if (use_dp4a_ && g.q8 && n <= NT) {
+            ensure_qx(x, n, g.cols, g.cols);
+            PcMatDp4a pd{g.w.addr(), g.s.addr(), u.w.addr(), u.s.addr(), xq_.addr(), xs_.addr(), y, (uint32_t)g.rows,
+                         (uint32_t)g.cols, (uint32_t)n, (uint32_t)g.rows, 0, 0};
+            gpu_.dispatch("q4_matmul_dp4a_swiglu", pd, groups(g.rows, 8), 1);
+        } else
             gpu_.dispatch(g.q8 ? "q4_matmul_q8_swiglu" : "q4_matmul_f32_swiglu", pc, groups(g.rows, 8), groups(n, NT));
     }
 
     // Mixes the residual streams at x[n][hc][H] into the block input xn_[n][H]; inj_ gets the injection logits.
     void hc_mix(const GHc& h, uint64_t x, int n) {
+        qx_valid_ = false;
         const int H = c_.hidden, HC = c_.hc_dim();
         PcHc pn{x, h.norm.addr(), xnorm_.addr(), (uint32_t)H, (uint32_t)c_.hc, c_.rms_eps};
         gpu_.dispatch("q4_hc_norm", pn, n, c_.hc);
@@ -872,11 +914,13 @@ private:
         mat(h.down, xnorm_.addr(), lo_.addr(), n, HC, 1, 1.0f / c_.hc, "hc_down");
         if (h.has_inject) mat(h.inject, xnorm_.addr(), inj_.addr(), n, HC, 0, 0, "hc_inject");
         gpu_.barrier();
+        qx_valid_ = false;
         mat(h.up, lo_.addr(), gate_.addr(), n, c_.hc_rank, 0, 0, "hc_up");
         gpu_.barrier();
         PcHc pm{xnorm_.addr(), gate_.addr(), xn_.addr(), (uint32_t)H, (uint32_t)c_.hc, c_.rms_eps};
         gpu_.dispatch("q4_hc_mix", pm, groups(H, 256), n);
         gpu_.barrier();
+        qx_valid_ = false;
     }
     // x[t][s] += 2 * sigmoid(inj_[t][s] / hc) * mix_[t]
     void hc_combine(uint64_t x, int n) {
@@ -886,6 +930,7 @@ private:
     }
 
     void ple(int l, int n) {
+        qx_valid_ = false;
         const GLayer& g = L_[l];
         const int H = c_.hidden, HC = c_.hc_dim();
         const VkDeviceSize hb = (VkDeviceSize)ple_hist_ * HC * 4;
@@ -928,6 +973,7 @@ private:
         PcGatedNorm pcg{core_.addr(), z_.addr(), g.lnorm.addr(), (uint32_t)c_.lin_v_heads, c_.rms_eps};
         gpu_.dispatch("gated_norm_sigmoid", pcg, n, c_.lin_v_heads);
         gpu_.barrier();
+        qx_valid_ = false;
         mat(g.out, core_.addr(), mix_.addr(), n, c_.lin_value_dim(), 0, 0, "dn_out");
         gpu_.barrier();
     }
@@ -991,6 +1037,7 @@ private:
         PcAttnCombine pc{part_.addr(), qg_.addr(), att_.addr(), (uint32_t)c_.n_heads, (uint32_t)splits};
         gpu_.dispatch("attn_combine", pc, n, c_.n_heads);
         gpu_.barrier();
+        qx_valid_ = false;
         mat(g.o, att_.addr(), mix_.addr(), n, AD, 0, 0, "attn_o");
         gpu_.barrier();
     }
@@ -1005,6 +1052,7 @@ private:
         mat(g.sgate, xn_.addr(), sgate_.addr(), n, H, 0, 0, "shared_gate");
         mat_swiglu(g.sh_gate, g.sh_up, xn_.addr(), sact_.addr(), n);
         gpu_.barrier();
+        qx_valid_ = false;
         mat(g.sh_down, sact_.addr(), sy_.addr(), n, c_.shared_inter, 0, 0, "shared_down");
         PcRoute pr{rlogits_.addr(), sel_.addr(), selw_.addr(), (uint32_t)E, (uint32_t)TK};
         gpu_.dispatch("moe_route", pr, n);
@@ -1248,6 +1296,7 @@ private:
         PcHc pcat{men_.addr(), xnorm_.addr(), mcat_.addr(), (uint32_t)H, (uint32_t)c_.hc, c_.rms_eps};
         gpu_.dispatch("q4_hc_cat", pcat, groups(2 * H, 256), n * c_.hc);
         gpu_.barrier();
+        qx_valid_ = false;
         mat(mtp_eh_, mcat_.addr(), mx_.addr(), n * c_.hc, 2 * H, 0, 0, "mtp_eh");
         gpu_.barrier();
         std::vector<int> deferred;

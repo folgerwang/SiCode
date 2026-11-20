@@ -1,0 +1,149 @@
+// Tensor-core GEMM (VK_KHR_cooperative_matrix, f16 x f16 -> f32) for GGUF-quantized W (codecs in q4_codec.glsl).
+// Same interface and 64x64x32 tiling as q4_gemm.comp, so the host selects this pipeline when gpu_.coop() is true.
+//
+// Shared memory is kept under 24 KB (18.5 KB dense, 23.5 KB SWIGLU) so 2 workgroups fit concurrently per SM
+// in 48 KB shared memory:
+//  - Ws[64*40] (5 KB) [+ Ws2[64*40] (5 KB) for SWIGLU] + Xs[64*40] (5 KB, pure fp16) + Cs[32*68] (8.5 KB,
+//    flushed in two 32-token passes j=0,1 with fp32 accumulation).
+// Variants: SWIGLU (silu(W1 x) * (W2 x)), EXPERT (grouped expert rows, up to 64 rows per entry).
+#version 460
+#include "common.glsl"
+#include "q4_codec.glsl"
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256) in;
+#define BM 64
+#define BN 64
+#define BK 32
+#define LDA (BK + 8)
+#define LDC (BM + 4)
+
+#ifdef EXPERT
+struct Entry { uint64_t base; uint start, count; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer Table { Entry e[]; };
+layout(push_constant) uniform PC {
+    uint64_t table, toks, x, y;
+    uint woff1, soff1, woff2, soff2, rows, cols, x_stride, y_stride, x_mode;
+} pc;
+#else
+layout(push_constant) uniform PC {
+    uint64_t w1, s1, w2, s2, x, y;
+    uint rows, cols, n, x_stride, y_stride, post;  // post 1: y = silu(y * post_scale)
+    float post_scale;
+} pc;
+#endif
+
+shared float16_t Ws[BM * LDA];  // 5,120 B
+#ifdef SWIGLU
+shared float16_t Ws2[BM * LDA]; // 5,120 B
+#endif
+shared float16_t Xs[BN * LDA];  // 5,120 B (pure fp16 activations)
+shared float Cs[32 * LDC];      // 8,704 B (32 tokens per flush pass; total 18.5 KB dense / 23.5 KB SWIGLU)
+
+#define MatA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MatB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define MatC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x, sg = gl_SubgroupID;
+    const uint r0 = gl_WorkGroupID.x * BM;
+    const uint cols = pc.cols;
+#ifdef EXPERT
+    const Entry en = Table(pc.table).e[gl_WorkGroupID.y];
+    const uint ntok = en.count, out0 = en.start;
+    const uint64_t w1 = en.base + pc.woff1, s1 = en.base + pc.soff1, w2 = en.base + pc.woff2, s2 = en.base + pc.soff2;
+#else
+    const uint t0 = gl_WorkGroupID.y * BN;
+    const uint ntok = min(BN, pc.n - t0), out0 = t0;
+    const uint64_t w1 = pc.w1, s1 = pc.s1, w2 = pc.w2, s2 = pc.s2;
+#endif
+    const uint lr = tid / 4u, lk = (tid % 4u) * 8u;
+    const bool tok_ok = lr < ntok;
+#ifdef EXPERT
+    const uint xrow = tok_ok ? (pc.x_mode == 0u ? U32(pc.toks).v[en.start + lr] : en.start + lr) : 0u;
+#else
+    const uint xrow = t0 + lr;
+#endif
+    const uint wrow = r0 + lr;
+    F4 xs = F4(pc.x + uint64_t(xrow) * pc.x_stride * 4u);
+
+    // subgroup sg owns rows rb*16.. and token blocks tb0, tb0+1 of the 64x64 output tile
+    const uint rb = sg / 2u, tb_half = sg % 2u, tb0 = tb_half * 2u;
+    MatC acc[2];
+#ifdef SWIGLU
+    MatC acc2[2];
+#endif
+    [[unroll]] for (uint j = 0; j < 2u; j++) {
+        acc[j] = MatC(0.0);
+#ifdef SWIGLU
+        acc2[j] = MatC(0.0);
+#endif
+    }
+
+    for (uint k0 = 0; k0 < cols; k0 += BK) {
+        const uint base = lr * LDA + lk;
+        {
+            vec4 a, b;
+            decode8(w1, s1, cols, wrow, (k0 + lk) >> 3, a, b);
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                Ws[base + j] = float16_t(a[j]);
+                Ws[base + 4u + j] = float16_t(b[j]);
+            }
+#ifdef SWIGLU
+            vec4 a2, b2;
+            decode8(w2, s2, cols, wrow, (k0 + lk) >> 3, a2, b2);
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                Ws2[base + j] = float16_t(a2[j]);
+                Ws2[base + 4u + j] = float16_t(b2[j]);
+            }
+#endif
+            vec4 x0 = vec4(0.0), x1 = vec4(0.0);
+            if (tok_ok) { x0 = xs.v[(k0 + lk) / 4u]; x1 = xs.v[(k0 + lk) / 4u + 1u]; }
+            [[unroll]] for (uint j = 0; j < 4u; j++) {
+                Xs[base + j] = float16_t(x0[j]);
+                Xs[base + 4u + j] = float16_t(x1[j]);
+            }
+        }
+        barrier();
+        [[unroll]] for (uint kk = 0; kk < BK; kk += 16u) {
+            MatA a;
+            coopMatLoad(a, Ws, rb * 16u * LDA + kk, LDA, gl_CooperativeMatrixLayoutRowMajor);
+#ifdef SWIGLU
+            MatA a2;
+            coopMatLoad(a2, Ws2, rb * 16u * LDA + kk, LDA, gl_CooperativeMatrixLayoutRowMajor);
+#endif
+            [[unroll]] for (uint j = 0; j < 2u; j++) {
+                MatB b;
+                coopMatLoad(b, Xs, (tb0 + j) * 16u * LDA + kk, LDA, gl_CooperativeMatrixLayoutColumnMajor);
+                acc[j] = coopMatMulAdd(a, b, acc[j]);
+#ifdef SWIGLU
+                acc2[j] = coopMatMulAdd(a2, b, acc2[j]);
+#endif
+            }
+        }
+        barrier();
+    }
+
+    // Flush 64x64 output in two 32-token passes through Cs[32 * LDC]
+    [[unroll]] for (uint j = 0; j < 2u; j++) {
+#ifdef SWIGLU
+        for (int i = 0; i < acc[j].length(); i++) acc[j][i] = silu(acc[j][i]) * acc2[j][i];
+#endif
+        coopMatStore(acc[j], Cs, tb_half * 16u * LDC + rb * 16u, LDC, gl_CooperativeMatrixLayoutColumnMajor);
+        barrier();
+        for (uint i = tid; i < BM * 32u; i += 256u) {
+            const uint lt = i / BM, r = i % BM;
+            const uint t = (lt < 16u) ? (lt + j * 16u) : (32u + (lt - 16u) + j * 16u);
+            if (t < ntok) {
+                float v = Cs[lt * LDC + r];
+#ifndef EXPERT
+                if (pc.post == 1u) v = silu(v * pc.post_scale);
+#endif
+                F32(pc.y + uint64_t(out0 + t) * pc.y_stride * 4u).v[r0 + r] = v;
+            }
+        }
+        barrier();
+    }
+}

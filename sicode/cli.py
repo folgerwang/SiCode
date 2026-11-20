@@ -1099,7 +1099,7 @@ def main():
     ap.add_argument("--vram-cap", type=float, default=None, metavar="GB",
                     help="the most VRAM that may be in use on the card, counting other programs (default: the saved "
                          "setting, else no cap); the local model sizes its expert cache to stay under it")
-    ap.add_argument("--backend", default="vulkan", choices=["vulkan", "cpu"], help="where the local model runs")
+    ap.add_argument("--backend", default="vulkan", choices=["vulkan", "cuda", "cpu"], help="where the local model runs")
     ap.add_argument("-p", "--prompt", help="run one request and exit; may start with [l] local, [c] cloud or [m] mix")
     ap.add_argument("--planner", default="auto", choices=["auto", *planners.PLANNERS],
                     help="who plans [c] requests: the Claude API key, or an account login through a local CLI "

@@ -101,12 +101,16 @@ public:
         }
 
         // Hardware feature detection: tensor cores via cooperative matrix (f16 x f16 -> f32, 16x16x16, subgroup)
+        // and integer dot product (dp4a: packed 4x8-bit uint32 dot product, core in Vulkan 1.3)
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR cmf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        VkPhysicalDeviceVulkan13Features q13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        q13.pNext = has_coop_ext ? &cmf : nullptr;
         VkPhysicalDeviceVulkan12Features q12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
-        q12.pNext = has_coop_ext ? &cmf : nullptr;
+        q12.pNext = &q13;
         VkPhysicalDeviceFeatures2 qf2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         qf2.pNext = &q12;
         vkGetPhysicalDeviceFeatures2(phys_, &qf2);
+        dp4a_ = q13.shaderIntegerDotProduct == VK_TRUE;
         if (has_coop_ext && cmf.cooperativeMatrix && q12.shaderFloat16 && !std::getenv("QW_NO_COOP")) {
             auto getp = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)vkGetInstanceProcAddr(
                 instance_, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
@@ -143,6 +147,7 @@ public:
         VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         f13.subgroupSizeControl = VK_TRUE;
         f13.computeFullSubgroups = VK_TRUE;
+        f13.shaderIntegerDotProduct = dp4a_ ? VK_TRUE : VK_FALSE;
         f13.pNext = coop_ ? &ecm : nullptr;
         VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
         f12.bufferDeviceAddress = VK_TRUE;
@@ -190,14 +195,17 @@ public:
         plci.pPushConstantRanges = &pcr;
         VK_CHECK(vkCreatePipelineLayout(dev_, &plci, nullptr, &layout_));
         for (auto& s : kShaders)
-            if (coop_ || std::strncmp(s.name, "gemm_coop", 9) != 0) pipelines_[s.name] = make_pipeline(s);
+            if ((coop_ || std::strstr(s.name, "_coop") == nullptr) &&
+                (dp4a_ || std::strstr(s.name, "_dp4a") == nullptr))
+                pipelines_[s.name] = make_pipeline(s);
         std::fprintf(stderr, "[vulkan] %s | subgroup %u-%u | shared mem %u KB | tensor cores (coop matrix f16): %s"
-                             " | fp8 coop matrix: %s | copy engine: %s\n",
+                             " | dp4a: %s | fp8 coop matrix: %s | copy engine: %s\n",
                      props_.deviceName, sscp.minSubgroupSize, sscp.maxSubgroupSize,
                      props_.limits.maxComputeSharedMemorySize / 1024, coop_ ? "yes" : "no",
-                     coop_fp8_ ? "available" : "no", tfam_ != UINT32_MAX ? "yes" : "no");
+                     dp4a_ ? "yes" : "no", coop_fp8_ ? "available" : "no", tfam_ != UINT32_MAX ? "yes" : "no");
     }
     bool coop() const { return coop_; }
+    bool dp4a() const { return dp4a_; }
 
     ~Gpu() {
         if (!dev_) return;
@@ -477,7 +485,7 @@ private:
     std::vector<Buf*> bufs_;
     VkDeviceSize allocated_device_ = 0;
     bool has_budget_ = false;
-    bool coop_ = false, coop_fp8_ = false;
+    bool coop_ = false, coop_fp8_ = false, dp4a_ = false;
     uint32_t tfam_ = UINT32_MAX;
     VkQueue tqueue_ = VK_NULL_HANDLE;
 };

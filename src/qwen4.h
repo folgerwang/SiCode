@@ -96,3 +96,4 @@ void q4_ple_embed(const Q4Config& c, const Q4Weights& w, const int* toks, int p,
 
 std::unique_ptr<Backend> make_qwen4_cpu_backend(const Q4Config& cfg, const Q4Weights& w, int max_ctx, int threads);
 std::unique_ptr<Backend> make_qwen4_vulkan_backend(const Q4Config& cfg, const Q4Weights& w, int max_ctx, const VulkanOptions& opt);
+std::unique_ptr<Backend> make_qwen4_cuda_backend(const Q4Config& cfg, const Q4Weights& w, int max_ctx, const VulkanOptions& opt);

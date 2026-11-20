@@ -1,0 +1,33 @@
+// On-the-fly Q8_1 activation quantization for DP4A matvec: X[n][cols] -> packed int8x4 (xq) + f32 scale per 32 (xs).
+// Workgroup = 256 threads (8 subgroups), each subgroup quantizes one 32-element block using subgroup shuffles (0 smem).
+#version 460
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform PC {
+    uint64_t x, xq, xs;
+    uint cols, x_stride, n;
+} pc;
+
+void main() {
+    const uint nblk = pc.cols >> 5;
+    const uint blk = gl_WorkGroupID.x * 8u + gl_SubgroupID;
+    const uint t = gl_WorkGroupID.y;
+    if (blk >= nblk || t >= pc.n) return;
+    const uint lane = gl_SubgroupInvocationID;
+
+    const float v = F32(pc.x + uint64_t(t) * pc.x_stride * 4u).v[blk * 32u + lane];
+    const float amax = subgroupMax(abs(v));
+    const float sc = amax > 0.0 ? amax / 127.0 : 0.0;
+    const float inv = amax > 0.0 ? 127.0 / amax : 0.0;
+    const uint b = uint(clamp(int(round(v * inv)), -127, 127)) & 0xFFu;
+    const uint b1 = subgroupShuffle(b, lane + 1u);
+    const uint b2 = subgroupShuffle(b, lane + 2u);
+    const uint b3 = subgroupShuffle(b, lane + 3u);
+    if ((lane & 3u) == 0u) {
+        const uint packed = b | (b1 << 8) | (b2 << 16) | (b3 << 24);
+        U32W(pc.xq).v[(t * nblk + blk) * 8u + (lane >> 2)] = packed;
+    }
+    if (lane == 0u) F32(pc.xs).v[t * nblk + blk] = sc;
+}

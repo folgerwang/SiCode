@@ -67,7 +67,7 @@ void usage() {
         "usage: qwen [options]\n"
         "  --model PATH         directory of *.gguf shards (or one .gguf file), or an FP8 safetensors model\n"
         "                       directory (default models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL)\n"
-        "  --backend cpu|vulkan inference backend (default cpu)\n"
+        "  --backend cpu|vulkan|cuda  inference backend (default cpu)\n"
         "  -p, --prompt TEXT    single prompt, then exit (otherwise interactive chat)\n"
         "  -f, --prompt-file F  read the single prompt from a file\n"
         "  --system TEXT        system prompt\n"
@@ -323,6 +323,19 @@ int main(int argc, char** argv) {
                 vo.threads = o.threads;
                 vo.draft = o.draft;
                 be = make_qwen4_vulkan_backend(qcfg, qw, ctx, vo);
+            }
+#endif
+#ifdef QW_CUDA
+            else if (o.backend == "cuda" || o.backend == "cu") {
+                VulkanOptions vo;
+                vo.expert_cache_mb = o.expert_cache_mb;
+                vo.stats_path = o.no_stats ? "" : state_dir + "/expert_usage.bin";
+                vo.pin_experts = !o.no_pin;
+                vo.hybrid = o.hybrid;
+                vo.expert_cache_set = o.expert_cache_set;
+                vo.threads = o.threads;
+                vo.draft = o.draft;
+                be = make_qwen4_cuda_backend(qcfg, qw, ctx, vo);
             }
 #endif
             else throw std::runtime_error("unknown/unavailable backend: " + o.backend);
